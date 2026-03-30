@@ -42,7 +42,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: velora-finance-${{ matrix.label }}
+          name: noryven-${{ matrix.label }}
           path: release_assets/*
 
   publish-downloads:
@@ -63,45 +63,60 @@ jobs:
         with:
           path: downloaded_artifacts
           merge-multiple: true
-          pattern: velora-finance-*
+          pattern: noryven-*
 
-      - name: Publish downloads into website folder
+      - name: Publish downloads to latest GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view downloads-latest >/dev/null 2>&1 || gh release create downloads-latest --title "Noryven downloads" --notes "Latest desktop artifacts for Noryven."
+          for asset in noryven-windows.exe noryven-macos.zip noryven-linux.tar.gz; do
+            gh release delete-asset downloads-latest "$asset" --yes >/dev/null 2>&1 || true
+          done
+          gh release upload downloads-latest downloaded_artifacts/* --clobber
+
+      - name: Update website download manifest
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python - <<'PY'
           from __future__ import annotations
+          import hashlib
           import json
-          import shutil
+          import os
           from datetime import datetime, timezone
           from pathlib import Path
 
           root = Path(".").resolve()
           downloads_dir = root / "website" / "downloads"
           downloads_dir.mkdir(parents=True, exist_ok=True)
+          artifacts_dir = root / "downloaded_artifacts"
 
           expected = {
-              "windows": "velora-finance-windows.exe",
-              "macos": "velora-finance-macos.zip",
-              "linux": "velora-finance-linux.tar.gz",
+              "windows": "noryven-windows.exe",
+              "macos": "noryven-macos.zip",
+              "linux": "noryven-linux.tar.gz",
           }
+          release_base_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/downloads-latest"
 
           for filename in expected.values():
               (downloads_dir / filename).unlink(missing_ok=True)
-
-          artifact_dir = root / "downloaded_artifacts"
-          for file_path in artifact_dir.glob("*"):
-              if file_path.is_file() and file_path.name in expected.values():
-                  shutil.copy2(file_path, downloads_dir / file_path.name)
 
           manifest_path = downloads_dir / "manifest.json"
           manifest = {
               "generated_at": datetime.now(timezone.utc).isoformat(),
           }
           for key, filename in expected.items():
-              target = downloads_dir / filename
+              target = artifacts_dir / filename
+              available = target.exists()
+              size_bytes = target.stat().st_size if available else 0
+              sha256 = hashlib.sha256(target.read_bytes()).hexdigest() if available else ""
               manifest[key] = {
-                  "available": target.exists(),
+                  "available": available,
                   "filename": filename,
-                  "url": f"/downloads/{filename}",
+                  "url": f"{release_base_url}/{filename}" if available else "",
+                  "sha256": sha256,
+                  "size_bytes": size_bytes,
               }
 
           manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

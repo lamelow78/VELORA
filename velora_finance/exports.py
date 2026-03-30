@@ -28,12 +28,12 @@ def export_month_bundle(kind: str, rows: list[dict], month_key: str, destination
         "invoice": "factures",
         "quote": "devis",
         "expense": "depenses",
-        "employee_expense": "depenses-employes",
+        "employee_expense": "paie",
     }
     if kind not in folder_names:
         raise ValueError("Type d'export inconnu.")
 
-    export_root = Path(destination_root) / f"velora-export-{month_key}" / folder_names[kind]
+    export_root = Path(destination_root) / f"noryven-export-{month_key}" / folder_names[kind]
     export_root.mkdir(parents=True, exist_ok=True)
     copied_files = 0
     missing_documents: list[str] = []

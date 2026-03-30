@@ -1,18 +1,28 @@
 {
+<<<<<<< HEAD
   "generated_at": "2026-03-30T17:52:12.409978+00:00",
+=======
+  "generated_at": "2026-03-30T16:55:00+00:00",
+>>>>>>> b813455 (ui: improve buttons, logo and interface polish)
   "windows": {
-    "available": true,
-    "filename": "velora-finance-windows.exe",
-    "url": "/downloads/velora-finance-windows.exe"
+    "available": false,
+    "filename": "noryven-windows.exe",
+    "url": "",
+    "sha256": "",
+    "size_bytes": 0
   },
   "macos": {
-    "available": true,
-    "filename": "velora-finance-macos.zip",
-    "url": "/downloads/velora-finance-macos.zip"
+    "available": false,
+    "filename": "noryven-macos.zip",
+    "url": "",
+    "sha256": "",
+    "size_bytes": 0
   },
   "linux": {
-    "available": true,
-    "filename": "velora-finance-linux.tar.gz",
-    "url": "/downloads/velora-finance-linux.tar.gz"
+    "available": false,
+    "filename": "noryven-linux.tar.gz",
+    "url": "",
+    "sha256": "",
+    "size_bytes": 0
   }
 }

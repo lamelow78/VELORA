@@ -12,3 +12,6 @@ build_artifacts/
 release_assets/
 
 website/.netlify/
+website/downloads/*.exe
+website/downloads/*.zip
+website/downloads/*.tar.gz

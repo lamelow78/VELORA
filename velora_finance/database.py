@@ -8,18 +8,24 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
-from .config import asset_path, storage_root
+from .config import (
+    asset_path,
+    default_documents_root,
+    documents_root,
+    legacy_documents_root,
+    storage_root,
+)
 
 
 DEFAULT_COMPANY_PROFILE = {
-    "company_name": "Votre entreprise",
-    "legal_name": "Votre entreprise SAS",
+    "company_name": "Noryven",
+    "legal_name": "Noryven SAS",
     "siret": "",
     "vat_number": "",
     "email": "",
     "phone": "",
     "address": "",
-    "footer": "Merci pour votre confiance.",
+    "footer": "",
     "logo_path": "",
 }
 
@@ -43,7 +49,12 @@ RECOGNIZED_INVOICE_STATUSES = ("Envoyee", "Payee", "En retard")
 class Database:
     def __init__(self, db_path: Path | None = None) -> None:
         self.root = storage_root()
-        self.db_path = Path(db_path) if db_path else self.root / "velora_finance.db"
+        if db_path:
+            self.db_path = Path(db_path)
+        else:
+            preferred_db_path = self.root / "noryven.db"
+            legacy_db_path = self.root / "velora_finance.db"
+            self.db_path = preferred_db_path if preferred_db_path.exists() or not legacy_db_path.exists() else legacy_db_path
         self.connection = sqlite3.connect(self.db_path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
@@ -746,7 +757,12 @@ class Database:
         self.connection.close()
 
     def reset_all_data(self) -> None:
-        documents_root = self.root / "documents"
+        document_roots = []
+        for candidate in {documents_root(), legacy_documents_root(), default_documents_root()}:
+            try:
+                document_roots.append(candidate.resolve())
+            except OSError:
+                continue
         self.connection.execute("PRAGMA foreign_keys = OFF")
         try:
             for table in ("sales", "expenses", "invoices", "quotes", "todos"):
@@ -755,18 +771,17 @@ class Database:
             self.connection.commit()
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
-        if documents_root.exists():
-            for path in sorted(documents_root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-                try:
-                    if path.is_file():
-                        path.unlink(missing_ok=True)
-                    elif path.is_dir():
-                        path.rmdir()
-                except OSError:
-                    continue
-        (documents_root / "factures").mkdir(parents=True, exist_ok=True)
-        (documents_root / "devis").mkdir(parents=True, exist_ok=True)
-        (documents_root / "depenses").mkdir(parents=True, exist_ok=True)
+        for root in document_roots:
+            if root.exists():
+                for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                    try:
+                        if path.is_file():
+                            path.unlink(missing_ok=True)
+                        elif path.is_dir():
+                            path.rmdir()
+                    except OSError:
+                        continue
+        documents_root()
         self._ensure_defaults()
 
     def _now(self) -> str:
@@ -794,7 +809,7 @@ class Database:
         profile = DEFAULT_COMPANY_PROFILE.copy()
         profile.update(self.get_setting("company_profile") or {})
         if not profile.get("logo_path"):
-            profile["logo_path"] = str(asset_path("velora_logo.png"))
+            profile["logo_path"] = str(asset_path("noryven_logo.svg"))
         return profile
 
     def save_company_profile(self, profile: dict) -> None:
@@ -815,6 +830,33 @@ class Database:
         clean_preferences.update(preferences)
         clean_preferences = self._validate_document_preferences(clean_preferences)
         self.set_setting("document_preferences", clean_preferences)
+
+    def get_employees(self) -> list[dict]:
+        employees = self.get_setting("employees") or []
+        if not isinstance(employees, list):
+            return []
+        clean_employees: list[dict] = []
+        for employee in employees:
+            try:
+                clean_employees.append(self._validate_employee(employee))
+            except Exception:
+                continue
+        clean_employees.sort(key=lambda item: item["name"].lower())
+        return clean_employees
+
+    def save_employees(self, employees: list[dict]) -> None:
+        if not isinstance(employees, list):
+            raise ValueError("La liste des employes est invalide.")
+        normalized: list[dict] = []
+        seen_names: set[str] = set()
+        for employee in employees:
+            clean_employee = self._validate_employee(employee)
+            key = clean_employee["name"].strip().lower()
+            if key in seen_names:
+                raise ValueError("Chaque employe doit avoir un nom unique.")
+            seen_names.add(key)
+            normalized.append(clean_employee)
+        self.set_setting("employees", normalized)
 
     def _parse_iso_date(self, value: str, label: str) -> date:
         try:
@@ -922,6 +964,27 @@ class Database:
         )
         return clean_preferences
 
+    def _validate_employee(self, employee: dict) -> dict:
+        if not isinstance(employee, dict):
+            raise ValueError("L'employe est invalide.")
+        name = str(employee.get("name", "")).strip()
+        if not name:
+            raise ValueError("Le nom de l'employe est obligatoire.")
+        role = str(employee.get("role", "")).strip()
+        status = str(employee.get("status", "")).strip() or "Actif"
+        gross_salary = float(employee.get("gross_salary", 0) or 0)
+        net_salary = float(employee.get("net_salary", 0) or 0)
+        if gross_salary < 0 or net_salary < 0:
+            raise ValueError("Les salaires employe doivent etre positifs.")
+        return {
+            "name": name,
+            "role": role,
+            "status": status,
+            "gross_salary": gross_salary,
+            "net_salary": net_salary,
+            "payroll_notes": str(employee.get("payroll_notes", "")).strip(),
+        }
+
     def _normalize_payroll_month(self, value: str) -> str:
         cleaned = str(value or "").strip()
         if not cleaned:
@@ -1028,6 +1091,7 @@ class Database:
         client_name = str(payload.get("client_name", "")).strip()
         if not client_name:
             raise ValueError("Le client est obligatoire.")
+        client_email = self._validate_email(payload.get("client_email", ""), "L'email client")
 
         items = payload.get("items") or []
         if not items:
@@ -1074,6 +1138,12 @@ class Database:
         html_path = str(payload.get("html_path", "")).strip()
         if not html_path:
             raise ValueError("Le chemin local du document est obligatoire.")
+        try:
+            html_path_obj = Path(html_path).expanduser().resolve()
+        except Exception as exc:
+            raise ValueError("Le chemin local du document est invalide.") from exc
+        if html_path_obj.suffix.lower() != ".html":
+            raise ValueError("Le chemin local du document doit pointer vers un fichier HTML.")
 
         company_profile = payload.get("company_profile")
         if not isinstance(company_profile, dict):
@@ -1086,7 +1156,7 @@ class Database:
             period_key: period_date.isoformat(),
             "status": status,
             "client_name": client_name,
-            "client_email": str(payload.get("client_email", "")).strip(),
+            "client_email": client_email,
             "client_address": str(payload.get("client_address", "")).strip(),
             "items": clean_items,
             "notes": str(payload.get("notes", "")).strip(),
@@ -1095,7 +1165,7 @@ class Database:
             "tax_amount": declared_tax_amount,
             "total": declared_total,
             "company_profile": company_profile,
-            "html_path": html_path,
+            "html_path": str(html_path_obj),
         }
         if "generated_at" in payload:
             validated["generated_at"] = str(payload["generated_at"]).strip()
@@ -1125,8 +1195,13 @@ class Database:
             target = Path(file_path).resolve()
         except Exception:
             return
-        documents_root = (self.root / "documents").resolve()
-        if documents_root not in target.parents:
+        allowed_roots: list[Path] = []
+        for candidate in (documents_root(), legacy_documents_root(), default_documents_root()):
+            try:
+                allowed_roots.append(candidate.resolve())
+            except OSError:
+                continue
+        if not any(root == target.parent or root in target.parents for root in allowed_roots):
             return
         try:
             target.unlink(missing_ok=True)
@@ -1160,6 +1235,32 @@ class Database:
                 validated["notes"],
                 now,
                 now,
+            ),
+        )
+        self.connection.commit()
+
+    def update_sale(self, sale_id: int, payload: dict) -> None:
+        validated = self._validate_financial_payload(payload, "sale_date")
+        self.connection.execute(
+            """
+            UPDATE sales
+            SET sale_date = ?, client = ?, company_name = ?, category = ?, amount = ?, amount_ht = ?, amount_ttc = ?,
+                source_type = ?, source_invoice_id = ?, notes = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                validated["date_value"],
+                validated["company_name"],
+                validated["company_name"],
+                validated["category"],
+                validated["amount_ttc"],
+                validated["amount_ht"],
+                validated["amount_ttc"],
+                validated["source_type"],
+                validated["source_invoice_id"],
+                validated["notes"],
+                self._now(),
+                sale_id,
             ),
         )
         self.connection.commit()
@@ -1222,6 +1323,45 @@ class Database:
             ),
         )
         self.connection.commit()
+
+    def update_expense(self, expense_id: int, payload: dict) -> None:
+        validated = self._validate_financial_payload(payload, "expense_date")
+        previous = self.connection.execute(
+            "SELECT attachment_path FROM expenses WHERE id = ?",
+            (expense_id,),
+        ).fetchone()
+        previous_attachment = str(previous["attachment_path"]) if previous else ""
+        new_attachment = validated["attachment_path"]
+        self.connection.execute(
+            """
+            UPDATE expenses
+            SET expense_date = ?, vendor = ?, company_name = ?, category = ?, expense_kind = ?, expense_label = ?, employee_name = ?, payroll_month = ?,
+                amount = ?, amount_ht = ?, amount_ttc = ?, source_type = ?, source_invoice_id = ?, attachment_path = ?, notes = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                validated["date_value"],
+                validated["company_name"],
+                validated["company_name"],
+                validated["category"],
+                validated["expense_kind"],
+                validated["expense_label"],
+                validated["employee_name"],
+                validated["payroll_month"],
+                validated["amount_ttc"],
+                validated["amount_ht"],
+                validated["amount_ttc"],
+                validated["source_type"],
+                validated["source_invoice_id"],
+                new_attachment,
+                validated["notes"],
+                self._now(),
+                expense_id,
+            ),
+        )
+        self.connection.commit()
+        if previous_attachment and previous_attachment != new_attachment:
+            self._delete_local_storage_file(previous_attachment)
 
     def list_expenses(self, expense_kind: str | None = None) -> list[sqlite3.Row]:
         query = """
@@ -1296,6 +1436,45 @@ class Database:
         )
         self.connection.commit()
         return int(cursor.lastrowid)
+
+    def update_invoice(self, invoice_id: int, payload: dict) -> None:
+        validated = self._validate_document_payload("invoice", payload)
+        previous = self.connection.execute(
+            "SELECT html_path FROM invoices WHERE id = ?",
+            (invoice_id,),
+        ).fetchone()
+        previous_html_path = str(previous["html_path"]) if previous else ""
+        self.connection.execute(
+            """
+            UPDATE invoices
+            SET number = ?, issue_date = ?, due_date = ?, status = ?, client_name = ?, client_email = ?,
+                client_address = ?, items_json = ?, notes = ?, tax_rate = ?, subtotal = ?, tax_amount = ?,
+                total = ?, company_json = ?, html_path = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                validated["number"],
+                validated["issue_date"],
+                validated["due_date"],
+                validated["status"],
+                validated["client_name"],
+                validated["client_email"],
+                validated["client_address"],
+                json.dumps(validated["items"], ensure_ascii=False),
+                validated["notes"],
+                validated["tax_rate"],
+                validated["subtotal"],
+                validated["tax_amount"],
+                validated["total"],
+                json.dumps(validated["company_profile"], ensure_ascii=False),
+                validated["html_path"],
+                self._now(),
+                invoice_id,
+            ),
+        )
+        self.connection.commit()
+        if previous_html_path and previous_html_path != validated["html_path"]:
+            self._delete_local_document_file(previous_html_path)
 
     def list_invoices(self) -> list[dict]:
         rows = self.connection.execute(
@@ -1386,6 +1565,45 @@ class Database:
         )
         self.connection.commit()
         return int(cursor.lastrowid)
+
+    def update_quote(self, quote_id: int, payload: dict) -> None:
+        validated = self._validate_document_payload("quote", payload)
+        previous = self.connection.execute(
+            "SELECT html_path FROM quotes WHERE id = ?",
+            (quote_id,),
+        ).fetchone()
+        previous_html_path = str(previous["html_path"]) if previous else ""
+        self.connection.execute(
+            """
+            UPDATE quotes
+            SET number = ?, issue_date = ?, valid_until = ?, status = ?, client_name = ?, client_email = ?,
+                client_address = ?, items_json = ?, notes = ?, tax_rate = ?, subtotal = ?, tax_amount = ?,
+                total = ?, company_json = ?, html_path = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                validated["number"],
+                validated["issue_date"],
+                validated["valid_until"],
+                validated["status"],
+                validated["client_name"],
+                validated["client_email"],
+                validated["client_address"],
+                json.dumps(validated["items"], ensure_ascii=False),
+                validated["notes"],
+                validated["tax_rate"],
+                validated["subtotal"],
+                validated["tax_amount"],
+                validated["total"],
+                json.dumps(validated["company_profile"], ensure_ascii=False),
+                validated["html_path"],
+                self._now(),
+                quote_id,
+            ),
+        )
+        self.connection.commit()
+        if previous_html_path and previous_html_path != validated["html_path"]:
+            self._delete_local_document_file(previous_html_path)
 
     def list_quotes(self) -> list[dict]:
         rows = self.connection.execute(

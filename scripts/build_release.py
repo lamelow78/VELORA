@@ -8,7 +8,7 @@ import tarfile
 from pathlib import Path
 
 
-APP_NAME = "velora-finance"
+APP_NAME = "noryven"
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -46,6 +46,7 @@ def run_pyinstaller(output_dir: Path) -> Path:
     ]
 
     if os.sys.platform == "win32":
+        command.extend(["--icon", os.fspath(ROOT / "assets" / "noryven_icon.ico")])
         command.extend(["--onefile", "--windowed"])
     elif os.sys.platform == "darwin":
         command.append("--windowed")
@@ -60,13 +61,13 @@ def run_pyinstaller(output_dir: Path) -> Path:
 def package_dist(dist_dir: Path, output_dir: Path) -> Path:
     if os.sys.platform == "win32":
         source = dist_dir / f"{APP_NAME}.exe"
-        target = output_dir / "velora-finance-windows.exe"
+        target = output_dir / "noryven-windows.exe"
         shutil.copy2(source, target)
         return target
 
     if os.sys.platform == "darwin":
         source = dist_dir / f"{APP_NAME}.app"
-        archive_base = output_dir / "velora-finance-macos"
+        archive_base = output_dir / "noryven-macos"
         archive_path = Path(
             shutil.make_archive(
                 base_name=os.fspath(archive_base),
@@ -78,14 +79,14 @@ def package_dist(dist_dir: Path, output_dir: Path) -> Path:
         return archive_path
 
     source = dist_dir / APP_NAME
-    target = output_dir / "velora-finance-linux.tar.gz"
+    target = output_dir / "noryven-linux.tar.gz"
     with tarfile.open(target, "w:gz") as archive:
         archive.add(source, arcname=APP_NAME)
     return target
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build Velora Finance release artifact.")
+    parser = argparse.ArgumentParser(description="Build Noryven release artifact.")
     parser.add_argument(
         "--output-dir",
         default="release_assets",
@@ -101,4 +102,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

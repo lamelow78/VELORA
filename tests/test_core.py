@@ -11,7 +11,7 @@ from velora_finance.documents import build_document_html, document_target_path, 
 from velora_finance.exports import export_month_bundle
 
 
-class VeloraCoreTests(unittest.TestCase):
+class NoryvenCoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.db_path = Path("test_suite.db")
         self.export_root = Path("test_exports")
@@ -50,7 +50,8 @@ class VeloraCoreTests(unittest.TestCase):
 
     def test_document_target_path_sanitizes_number(self) -> None:
         target = document_target_path("invoice", "..\\evil/facture:test")
-        self.assertEqual(target.name, "evil-facture-test.html")
+        self.assertTrue(target.name.startswith("facture_evil-facture-test_"))
+        self.assertTrue(target.name.endswith(".html"))
         self.assertIn("documents", str(target))
         self.assertIn("factures", str(target))
 
@@ -237,11 +238,11 @@ class VeloraCoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.save_company_profile(
                 {
-                    "company_name": "Velora",
-                    "legal_name": "Velora SAS",
+                    "company_name": "Noryven",
+                    "legal_name": "Noryven SAS",
                     "siret": "1234",
                     "vat_number": "FR12345678901",
-                    "email": "contact@velora.fr",
+                    "email": "contact@noryven.fr",
                     "phone": "0102030405",
                     "address": "1 rue test",
                     "footer": "Merci",
@@ -256,6 +257,26 @@ class VeloraCoreTests(unittest.TestCase):
                     "default_client_email": "email-invalide",
                 }
             )
+
+    def test_create_invoice_rejects_invalid_client_email(self) -> None:
+        payload = self._invoice_payload("FACT-BAD-EMAIL-001", "Acme")
+        payload["client_email"] = "email-invalide"
+        with self.assertRaises(ValueError):
+            self.db.create_invoice({**payload, "html_path": document_target_path("invoice", payload["number"])})
+
+    def test_create_invoice_rejects_non_html_target_path(self) -> None:
+        payload = self._invoice_payload("FACT-BAD-PATH-001", "Acme")
+        with self.assertRaises(ValueError):
+            self.db.create_invoice({**payload, "html_path": self.export_root / "facture.txt"})
+
+    def test_create_invoice_normalizes_relative_html_path_to_absolute(self) -> None:
+        payload = self._invoice_payload("FACT-ABSOLUTE-001", "Acme")
+        relative_path = self.export_root / "nested" / "facture-relative.html"
+        self.db.create_invoice({**payload, "html_path": relative_path})
+
+        stored = self.db.list_invoices()[0]
+        self.assertTrue(Path(stored["html_path"]).is_absolute())
+        self.assertTrue(stored["html_path"].endswith("facture-relative.html"))
 
     def test_add_sale_rejects_invalid_data_at_database_level(self) -> None:
         with self.assertRaises(ValueError):
@@ -505,6 +526,15 @@ class VeloraCoreTests(unittest.TestCase):
         missing_csv = export_result.export_root / "documents-manquants-2026-03.csv"
         self.assertTrue(missing_csv.exists())
         self.assertIn("FACT-EXPORT-MISSING-001", missing_csv.read_text(encoding="utf-8"))
+
+    def test_save_document_html_creates_missing_parent_directories(self) -> None:
+        payload = self._invoice_payload("FACT-SAVE-001", "Client Save")
+        target = self.export_root / "missing" / "nested" / "facture-save.html"
+
+        result = save_document_html("invoice", payload, target)
+
+        self.assertEqual(result, target)
+        self.assertTrue(target.exists())
 
 
 if __name__ == "__main__":

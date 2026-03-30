@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import calendar as pycalendar
+import csv
+import os
 import shutil
+import subprocess
+import sys
 import tkinter as tk
-import webbrowser
 import tkinter.font as tkfont
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -27,8 +30,13 @@ from .config import (
     COLOR_TEXT,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
+    available_document_directories,
     asset_path,
+    default_documents_root,
+    document_directory,
+    documents_root,
     get_theme_palette,
+    set_documents_root,
     storage_root,
 )
 from .database import Database
@@ -136,7 +144,7 @@ FRENCH_MONTHS = [
 
 
 def main() -> None:
-    app = VeloraApp()
+    app = NoryvenApp()
     app.mainloop()
 
 
@@ -235,18 +243,122 @@ def style_text_widget(widget: tk.Text, background: str | None = None) -> None:
         pady=10,
         font=(FONT_BODY, 10),
     )
+    bind_widget_mousewheel(widget)
 
 
-def copy_expense_attachment(source_path: str) -> Path:
+def copy_expense_attachment(source_path: str, kind: str = "expense", subject: str = "", document_date: str | None = None) -> Path:
     source = Path(source_path).expanduser().resolve()
     if not source.exists() or not source.is_file():
         raise ValueError("Le fichier de depense selectionne est introuvable.")
-    target_root = storage_root() / "documents" / "depenses"
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_name = safe_document_stem(source.stem)
-    target = target_root / f"{timestamp}-{safe_name}{source.suffix.lower()}"
+    target = document_target_path(
+        kind,
+        subject or source.stem,
+        document_date or date.today().isoformat(),
+        source.suffix.lower(),
+    )
     shutil.copy2(source, target)
     return target
+
+
+def normalized_mousewheel_units(event) -> int:
+    button_number = int(getattr(event, "num", 0) or 0)
+    if button_number == 4:
+        return -1
+    if button_number == 5:
+        return 1
+
+    delta = int(getattr(event, "delta", 0) or 0)
+    if delta == 0:
+        return 0
+    step_count = max(1, int(round(abs(delta) / 120))) if abs(delta) >= 120 else 1
+    return -step_count if delta > 0 else step_count
+
+
+def bind_wheel_events(widget, callback) -> None:
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        widget.bind(sequence, callback)
+
+
+def resolve_mousewheel_router(widget):
+    try:
+        top = widget.winfo_toplevel()
+    except Exception:
+        return None
+
+    router = getattr(top, "route_mousewheel", None)
+    if callable(router):
+        return router
+
+    owner = getattr(top, "app", None)
+    router = getattr(owner, "route_mousewheel", None)
+    if callable(router):
+        return router
+    return None
+
+
+def bind_widget_mousewheel(widget) -> None:
+    callback = resolve_mousewheel_router(widget)
+    if callback is None:
+        return
+    bind_wheel_events(widget, callback)
+
+
+def widget_supports_yview(widget) -> bool:
+    return callable(getattr(widget, "yview", None)) and callable(getattr(widget, "yview_scroll", None))
+
+
+def widget_has_vertical_overflow(widget) -> bool:
+    if not widget_supports_yview(widget):
+        return False
+    try:
+        first, last = widget.yview()
+    except Exception:
+        return False
+    try:
+        return float(first) > 0.0 or float(last) < 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def create_scrolled_treeview(master, columns, height: int, frame_style: str = "Surface.TFrame", **tree_kwargs):
+    shell = ttk.Frame(master, style=frame_style)
+    shell.columnconfigure(0, weight=1)
+    shell.rowconfigure(0, weight=1)
+
+    tree = ttk.Treeview(shell, columns=columns, show=tree_kwargs.pop("show", "headings"), height=height, **tree_kwargs)
+    scrollbar = ttk.Scrollbar(shell, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scrollbar.set)
+
+    tree.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    bind_widget_mousewheel(tree)
+    return shell, tree
+
+
+def resolve_local_path(path_value: str | Path) -> Path:
+    return Path(path_value).expanduser().resolve()
+
+
+def open_local_file(path_value: str | Path, missing_message: str = "Le fichier local est introuvable.") -> None:
+    cleaned = str(path_value or "").strip()
+    if not cleaned:
+        raise FileNotFoundError(missing_message)
+
+    target = resolve_local_path(cleaned)
+    if not target.exists():
+        raise FileNotFoundError(missing_message)
+
+    if os.name == "nt":
+        opener = getattr(os, "startfile", None)
+        if opener is None:
+            raise OSError("Ouverture automatique indisponible sur ce systeme.")
+        opener(os.fspath(target))
+        return
+
+    command = ["open", os.fspath(target)] if sys.platform == "darwin" else ["xdg-open", os.fspath(target)]
+    completed = subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if completed.returncode != 0:
+        raise OSError("Impossible d'ouvrir automatiquement le fichier local.")
 
 
 def pulse_panel(panel: ttk.Frame, base_padding: int = 18) -> None:
@@ -497,8 +609,10 @@ class SidebarScrollArea(tk.Frame):
 
         self.content.bind("<Configure>", self._sync_scrollregion)
         self.canvas.bind("<Configure>", self._sync_width)
-        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self.content.bind("<MouseWheel>", self._on_mousewheel)
+        for widget in (self.canvas, self.content):
+            widget.bind("<MouseWheel>", self._on_mousewheel)
+            widget.bind("<Button-4>", self._on_mousewheel)
+            widget.bind("<Button-5>", self._on_mousewheel)
 
     def _sync_scrollregion(self, _event=None) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -507,10 +621,9 @@ class SidebarScrollArea(tk.Frame):
         self.canvas.itemconfigure(self._content_window, width=event.width)
 
     def _on_mousewheel(self, event) -> str:
-        delta = int(getattr(event, "delta", 0))
-        units = -int(delta / 120) if delta else 0
+        units = normalized_mousewheel_units(event)
         if units == 0:
-            units = -1 if delta > 0 else 1
+            return "break"
         self.scroll_units(units * 3)
         return "break"
 
@@ -620,8 +733,10 @@ class ScrollableFrame(ttk.Frame):
 
         self.content.bind("<Configure>", self._sync_scrollregion)
         self.canvas.bind("<Configure>", self._sync_width)
-        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self.content.bind("<MouseWheel>", self._on_mousewheel)
+        for widget in (self.canvas, self.content):
+            widget.bind("<MouseWheel>", self._on_mousewheel)
+            widget.bind("<Button-4>", self._on_mousewheel)
+            widget.bind("<Button-5>", self._on_mousewheel)
 
     def _sync_scrollregion(self, _event=None) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -630,8 +745,10 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.itemconfigure(self._content_window, width=event.width)
 
     def _on_mousewheel(self, event) -> str:
-        delta = -1 if event.delta > 0 else 1
-        self.scroll_units(delta * 3)
+        units = normalized_mousewheel_units(event)
+        if units == 0:
+            return "break"
+        self.scroll_units(units * 3)
         return "break"
 
     def scroll_units(self, units: int) -> None:
@@ -642,6 +759,151 @@ class ScrollableFrame(ttk.Frame):
 
     def scroll_home(self) -> None:
         self.canvas.yview_moveto(0)
+
+
+def format_file_size(size: int) -> str:
+    units = ["o", "Ko", "Mo", "Go"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "o":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}".replace(".", ",")
+        value /= 1024
+    return f"{int(size)} o"
+
+
+class FilePreviewWindow(tk.Toplevel):
+    def __init__(self, app: "VeloraApp", file_path: str | Path, title: str = "Apercu du fichier") -> None:
+        super().__init__(app)
+        self.app = app
+        self.target = resolve_local_path(file_path)
+        self.preview_image = None
+        self.scroll_target = None
+
+        self.title(title)
+        self.geometry("900x680")
+        self.minsize(760, 560)
+        self.configure(bg=COLOR_BG)
+        self.transient(app)
+
+        shell = ttk.Frame(self, style="App.TFrame", padding=20)
+        shell.pack(fill="both", expand=True)
+        shell.rowconfigure(1, weight=1)
+        shell.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(shell, style="App.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        ttk.Label(header, text=self.target.name, style="PageTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text=f"{self.target.suffix.lower() or 'fichier'} | {format_file_size(self.target.stat().st_size)} | {self.target}",
+            style="Muted.TLabel",
+            wraplength=820,
+        ).pack(anchor="w", pady=(4, 0))
+
+        body = ttk.Frame(shell, style="Surface.TFrame", padding=18)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        footer = ttk.Frame(shell, style="App.TFrame")
+        footer.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        RoundButton(footer, text="Ouvrir le fichier", style_name="Ghost.TButton", command=lambda: open_local_file(self.target)).pack(side="left")
+        RoundButton(footer, text="Ouvrir le dossier", style_name="Ghost.TButton", command=lambda: open_local_file(self.target.parent)).pack(side="left", padx=8)
+        RoundButton(footer, text="Fermer", style_name="Accent.TButton", command=self.destroy).pack(side="right")
+
+        suffix = self.target.suffix.lower()
+        if suffix in {".txt", ".log", ".csv", ".html", ".htm", ".json"}:
+            self._build_text_preview(body, suffix)
+        elif suffix in {".png", ".gif", ".ppm", ".pgm"}:
+            self._build_image_preview(body)
+        elif suffix == ".pdf":
+            self._build_pdf_preview(body)
+        else:
+            self._build_fallback_preview(body, "Le format n'est pas previsualisable directement dans l'application.")
+
+    def _build_text_preview(self, master, suffix: str) -> None:
+        text = tk.Text(master, wrap="word", bd=0, highlightthickness=0)
+        text.grid(row=0, column=0, sticky="nsew")
+        style_text_widget(text, COLOR_SURFACE)
+        scrollbar = ttk.Scrollbar(master, orient="vertical", command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+        self.scroll_target = text
+        raw = self.target.read_text(encoding="utf-8", errors="replace")
+        if suffix == ".csv":
+            rows = list(csv.reader(raw.splitlines(), delimiter=";"))
+            lines = [" | ".join(row) for row in rows[:120]]
+            raw = "\n".join(lines)
+        text.insert("1.0", raw[:80000] or "Fichier vide.")
+        text.configure(state="disabled")
+
+    def _build_image_preview(self, master) -> None:
+        canvas = tk.Canvas(master, bg=COLOR_SURFACE, highlightthickness=0, bd=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_image = tk.PhotoImage(file=str(self.target))
+        canvas.create_image(24, 24, image=self.preview_image, anchor="nw")
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        scrollbar = ttk.Scrollbar(master, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        self.scroll_target = canvas
+        bind_wheel_events(canvas, lambda event: self._scroll_canvas(event, canvas))
+
+    def _scroll_canvas(self, event, canvas: tk.Canvas) -> str:
+        units = normalized_mousewheel_units(event)
+        if units == 0:
+            return "break"
+        canvas.yview_scroll(units * 3, "units")
+        return "break"
+
+    def _build_pdf_preview(self, master) -> None:
+        self._build_fallback_preview(
+            master,
+            "Le PDF est bien detecte et peut etre ouvert depuis l'application.\n\n"
+            "Le rendu complet du contenu PDF n'est pas integre nativement dans cette version sans moteur PDF externe.",
+        )
+
+    def _build_fallback_preview(self, master, message: str) -> None:
+        card = ttk.Frame(master, style="SurfaceSoft.TFrame", padding=24)
+        card.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(card, text="Apercu limite", style="SectionTitleSoft.TLabel").pack(anchor="w")
+        ttk.Label(card, text=message, style="MutedSoft.TLabel", wraplength=700).pack(anchor="w", pady=(10, 0))
+        self.scroll_target = None
+
+    def scroll_units(self, units: int) -> None:
+        if self.scroll_target is not None and widget_supports_yview(self.scroll_target):
+            self.scroll_target.yview_scroll(units, "units")
+
+    def scroll_pages(self, pages: int) -> None:
+        if self.scroll_target is not None and widget_supports_yview(self.scroll_target):
+            self.scroll_target.yview_scroll(pages, "pages")
+
+
+class InlineToast(tk.Frame):
+    def __init__(self, master, title: str, message: str, level: str, on_close) -> None:
+        accent_map = {
+            "success": COLOR_SUCCESS,
+            "warning": COLOR_WARNING,
+            "error": COLOR_DANGER,
+            "info": COLOR_TEAL,
+        }
+        accent = accent_map.get(level, COLOR_TEAL)
+        super().__init__(master, bg=COLOR_SURFACE, highlightthickness=1, highlightbackground=COLOR_BORDER, bd=0)
+        self.on_close = on_close
+
+        self.columnconfigure(1, weight=1)
+        tk.Frame(self, bg=accent, width=4).grid(row=0, column=0, sticky="ns")
+        body = tk.Frame(self, bg=COLOR_SURFACE, padx=14, pady=12)
+        body.grid(row=0, column=1, sticky="nsew")
+        tk.Label(body, text=title, bg=COLOR_SURFACE, fg=COLOR_TEXT, font=(FONT_BODY_SEMIBOLD, 10)).pack(anchor="w")
+        tk.Label(body, text=message, bg=COLOR_SURFACE, fg=COLOR_TEXT_MUTED, justify="left", wraplength=320, font=(FONT_BODY, 9)).pack(anchor="w", pady=(4, 0))
+        close_button = RoundButton(body, text="Fermer", style_name="Ghost.TButton", command=self.close, min_height=34, min_width=88)
+        close_button.pack(anchor="e", pady=(10, 0))
+
+    def close(self) -> None:
+        self.on_close(self)
 
 
 class MetricCard(ttk.Frame):
@@ -1314,10 +1576,11 @@ class FinancialEntryPage(BaseEntryPage):
         super().__init__(master, app, title, subtitle)
         self.record_kind = record_kind
         self.categories = categories
-        self.action_label = action_label
+        self.default_category = default_category
         self.button_style = button_style
         self.rows: dict[str, dict] = {}
         self.invoice_map: dict[str, dict] = {}
+        self.editing_record_id: int | None = None
 
         self.date_var = tk.StringVar(value=date.today().isoformat())
         self.source_mode_var = tk.StringVar(value="Manuel")
@@ -1327,16 +1590,19 @@ class FinancialEntryPage(BaseEntryPage):
         self.amount_ht_var = tk.StringVar()
         self.amount_ttc_var = tk.StringVar()
         self.notes_var = tk.StringVar()
+        self.form_mode_var = tk.StringVar(value=action_label)
+        self.form_hint_var = tk.StringVar(value="Saisie locale modifiable a tout moment.")
         self.attachment_label_var = tk.StringVar(value="Aucune facture de depense selectionnee")
         self.attachment_source_path = ""
+        self.attachment_existing_path = ""
 
         self._build_form()
         self._build_table()
         self.refresh_invoice_options()
 
     def _build_form(self) -> None:
-        form_title = "Nouvel enregistrement" if self.record_kind == "sale" else "Nouvelle depense"
-        ttk.Label(self.form_card, text=form_title, style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.form_card, textvariable=self.form_mode_var, style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.form_card, textvariable=self.form_hint_var, style="MutedSurface.TLabel", wraplength=280).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 12))
 
         fields = [
             ("Date", self.date_var),
@@ -1349,7 +1615,8 @@ class FinancialEntryPage(BaseEntryPage):
             ("Notes", self.notes_var),
         ]
         for index, (label, variable) in enumerate(fields, start=1):
-            self._create_label(self.form_card, label, index * 2 - 1)
+            row_cursor = index * 2 + 1
+            self._create_label(self.form_card, label, row_cursor - 1)
             if label == "Mode":
                 widget = ttk.Combobox(self.form_card, textvariable=variable, values=["Manuel", "Depuis facture"], state="readonly")
                 widget.bind("<<ComboboxSelected>>", lambda _event: self.on_mode_change())
@@ -1361,33 +1628,23 @@ class FinancialEntryPage(BaseEntryPage):
                 widget = ttk.Combobox(self.form_card, textvariable=variable, values=self.categories, state="readonly")
             else:
                 widget = ttk.Entry(self.form_card, textvariable=variable)
-            widget.grid(row=index * 2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+            widget.grid(row=row_cursor, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
-        action_row = 18
-        help_row = 19
+        action_row = 20
         if self.record_kind == "expense":
-            self._create_label(self.form_card, "Facture de depense locale", 17)
+            self._create_label(self.form_card, "Piece jointe locale", 18)
             file_actions = ttk.Frame(self.form_card, style="Surface.TFrame")
-            file_actions.grid(row=18, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            file_actions.grid(row=19, column=0, columnspan=2, sticky="ew", pady=(0, 8))
             RoundButton(file_actions, text="Choisir un fichier", style_name="Ghost.TButton", command=self.pick_attachment).pack(side="left")
             RoundButton(file_actions, text="Ouvrir", style_name="Ghost.TButton", command=self.open_attachment).pack(side="left", padx=8)
             RoundButton(file_actions, text="Retirer", style_name="Ghost.TButton", command=self.clear_attachment).pack(side="left")
-            ttk.Label(self.form_card, textvariable=self.attachment_label_var, style="MutedSurface.TLabel", wraplength=260).grid(row=19, column=0, columnspan=2, sticky="w", pady=(0, 10))
-            action_row = 20
-            help_row = 21
+            ttk.Label(self.form_card, textvariable=self.attachment_label_var, style="MutedSurface.TLabel", wraplength=260).grid(row=20, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            action_row = 21
 
-        RoundButton(self.form_card, text=self.action_label, style_name=self.button_style, command=self.add_record).grid(row=action_row, column=0, sticky="ew", pady=(8, 0))
-        help_text = (
-            "Mode facture: les informations HT/TTC et le nom client sont recuperes automatiquement. Mode manuel: vous saisissez vos propres montants."
-            if self.record_kind == "sale"
-            else "Mode facture: recupere une facture client existante. Mode manuel: ajoutez vos montants. Facture de depense locale: joignez un fichier de votre machine qui sera copie localement dans le logiciel."
-        )
-        ttk.Label(
-            self.form_card,
-            text=help_text,
-            style="MutedSurface.TLabel",
-            wraplength=260,
-        ).grid(row=help_row, column=0, sticky="w", pady=(12, 0))
+        actions = ttk.Frame(self.form_card, style="Surface.TFrame")
+        actions.grid(row=action_row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        RoundButton(actions, text="Enregistrer", style_name=self.button_style, command=self.save_record).pack(side="left")
+        RoundButton(actions, text="Annuler l'edition", style_name="Ghost.TButton", command=self.reset_form).pack(side="left", padx=8)
         self.form_card.columnconfigure(0, weight=1)
 
     def pick_attachment(self) -> None:
@@ -1401,18 +1658,22 @@ class FinancialEntryPage(BaseEntryPage):
         if filename:
             self.attachment_source_path = filename
             self.attachment_label_var.set(Path(filename).name)
+            self.attachment_existing_path = ""
 
     def open_attachment(self) -> None:
-        source = self.attachment_source_path.strip()
+        source = self.attachment_source_path.strip() or self.attachment_existing_path.strip()
         if not source:
             return
         try:
-            webbrowser.open(Path(source).resolve().as_uri())
+            open_local_file(source, missing_message="La facture locale selectionnee est introuvable.")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Depense", str(exc))
         except Exception:
-            messagebox.showerror("Depense", "Impossible d'ouvrir la facture locale selectionnee.")
+            self.app.notify_error("Depense", "Impossible d'ouvrir la piece jointe selectionnee.")
 
     def clear_attachment(self) -> None:
         self.attachment_source_path = ""
+        self.attachment_existing_path = ""
         self.attachment_label_var.set("Aucune facture de depense selectionnee")
 
     def _build_table(self) -> None:
@@ -1420,10 +1681,11 @@ class FinancialEntryPage(BaseEntryPage):
         top.pack(fill="x")
         table_title = "Historique des recettes" if self.record_kind == "sale" else "Historique des depenses"
         ttk.Label(top, text=table_title, style="SectionTitle.TLabel").pack(side="left")
+        RoundButton(top, text="Modifier", style_name="Ghost.TButton", command=self.load_selected).pack(side="right", padx=(0, 8))
         RoundButton(top, text="Supprimer la selection", style_name="Ghost.TButton", command=self.delete_selected).pack(side="right")
 
         columns = ("date", "company", "source", "category", "ht", "ttc", "added")
-        self.tree = ttk.Treeview(self.table_card, columns=columns, show="headings", height=18)
+        table_shell, self.tree = create_scrolled_treeview(self.table_card, columns=columns, height=18)
         headings = {
             "date": "Date",
             "company": "Entreprise",
@@ -1437,7 +1699,8 @@ class FinancialEntryPage(BaseEntryPage):
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
-        self.tree.pack(fill="both", expand=True, pady=(12, 0))
+        table_shell.pack(fill="both", expand=True, pady=(12, 0))
+        self.tree.bind("<Double-1>", lambda _event: self.load_selected())
 
     def refresh_invoice_options(self) -> None:
         self.invoice_map.clear()
@@ -1470,7 +1733,60 @@ class FinancialEntryPage(BaseEntryPage):
             self.category_var.set("Facture")
         self.notes_var.set(f"Rattache a la facture {invoice['number']}")
 
-    def add_record(self) -> None:
+    def selected_row(self) -> dict | None:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        return self.rows.get(selection[0])
+
+    def _find_invoice_choice(self, invoice_id: int | None) -> str:
+        if invoice_id is None:
+            return ""
+        for label, record in self.invoice_map.items():
+            if record["id"] == invoice_id:
+                return label
+        return ""
+
+    def load_selected(self) -> None:
+        record = self.selected_row()
+        if not record:
+            return
+        self.editing_record_id = int(record["id"])
+        self.form_mode_var.set("Modifier l'enregistrement")
+        self.form_hint_var.set(f"Edition de la ligne du {record[self.date_key]}.")
+        self.date_var.set(record[self.date_key])
+        self.company_var.set(record["company_name"])
+        self.category_var.set(record["category"])
+        self.amount_ht_var.set(str(record["amount_ht"]))
+        self.amount_ttc_var.set(str(record["amount_ttc"]))
+        self.notes_var.set(record.get("notes", "") or "")
+        source_mode = "Depuis facture" if record.get("source_type") == "invoice" else "Manuel"
+        self.source_mode_var.set(source_mode)
+        self.on_mode_change()
+        self.invoice_choice_var.set(self._find_invoice_choice(record.get("source_invoice_id")))
+        if self.record_kind == "expense":
+            attachment_path = str(record.get("attachment_path", "")).strip()
+            self.attachment_source_path = ""
+            self.attachment_existing_path = attachment_path
+            self.attachment_label_var.set(Path(attachment_path).name if attachment_path else "Aucune facture de depense selectionnee")
+
+    def reset_form(self) -> None:
+        self.editing_record_id = None
+        self.form_mode_var.set("Nouvel enregistrement" if self.record_kind == "sale" else "Nouvelle depense")
+        self.form_hint_var.set("Saisie locale modifiable a tout moment.")
+        self.date_var.set(date.today().isoformat())
+        self.source_mode_var.set("Manuel")
+        self.invoice_choice_var.set("")
+        self.company_var.set("")
+        self.category_var.set(self.default_category)
+        self.amount_ht_var.set("")
+        self.amount_ttc_var.set("")
+        self.notes_var.set("")
+        self.on_mode_change()
+        if self.record_kind == "expense":
+            self.clear_attachment()
+
+    def save_record(self) -> None:
         copied_attachment = ""
         try:
             parse_iso_date(self.date_var.get())
@@ -1495,32 +1811,43 @@ class FinancialEntryPage(BaseEntryPage):
                 "source_invoice_id": source_invoice_id,
                 "notes": self.notes_var.get().strip(),
             }
-            if self.record_kind == "expense" and self.attachment_source_path.strip():
-                copied_attachment = str(copy_expense_attachment(self.attachment_source_path))
-                payload["attachment_path"] = copied_attachment
+            if self.record_kind == "expense":
+                if self.attachment_source_path.strip():
+                    copied_attachment = str(
+                        copy_expense_attachment(
+                            self.attachment_source_path,
+                            "expense",
+                            company_name,
+                            self.date_var.get(),
+                        )
+                    )
+                    payload["attachment_path"] = copied_attachment
+                elif self.attachment_existing_path.strip():
+                    payload["attachment_path"] = self.attachment_existing_path.strip()
         except Exception as exc:
-            messagebox.showerror("Erreur", f"Impossible d'enregistrer.\n\n{exc}")
+            self.app.notify_error("Enregistrement", f"Impossible d'enregistrer.\n\n{exc}")
             return
 
         try:
-            if self.record_kind == "sale":
+            if self.record_kind == "sale" and self.editing_record_id is None:
                 self.app.db.add_sale(payload)
-            else:
+            elif self.record_kind == "sale":
+                self.app.db.update_sale(self.editing_record_id, payload)
+            elif self.editing_record_id is None:
                 self.app.db.add_expense(payload)
+            else:
+                self.app.db.update_expense(self.editing_record_id, payload)
         except Exception as exc:
             if copied_attachment:
                 Path(copied_attachment).unlink(missing_ok=True)
-            messagebox.showerror("Erreur", f"Impossible d'enregistrer.\n\n{exc}")
+            self.app.notify_error("Enregistrement", f"Impossible d'enregistrer.\n\n{exc}")
             return
 
-        self.company_var.set("")
-        self.amount_ht_var.set("")
-        self.amount_ttc_var.set("")
-        self.notes_var.set("")
-        if self.record_kind == "expense":
-            self.clear_attachment()
-        if self.source_mode_var.get() == "Depuis facture":
-            self.apply_invoice_source()
+        self.app.notify_success(
+            "Enregistrement",
+            "La ligne a ete mise a jour." if self.editing_record_id is not None else "La ligne a ete ajoutee.",
+        )
+        self.reset_form()
         self.app.refresh_all_pages()
 
     def refresh(self) -> None:
@@ -1560,6 +1887,8 @@ class FinancialEntryPage(BaseEntryPage):
             self.app.db.delete_sale(record_id)
         else:
             self.app.db.delete_expense(record_id)
+        self.app.notify_success("Suppression", "La ligne a ete supprimee.")
+        self.reset_form()
         self.app.refresh_all_pages()
 
 
@@ -1601,7 +1930,9 @@ class ExpensesPage(FinancialEntryPage):
         top = ttk.Frame(self.table_card, style="Surface.TFrame")
         top.pack(fill="x")
         ttk.Label(top, text="Historique des depenses", style="SectionTitle.TLabel").pack(side="left")
+        RoundButton(top, text="Apercu", style_name="Ghost.TButton", command=self.preview_selected_attachment).pack(side="right", padx=(0, 8))
         RoundButton(top, text="Ouvrir la facture", style_name="Ghost.TButton", command=self.open_selected_attachment).pack(side="right", padx=(0, 8))
+        RoundButton(top, text="Modifier", style_name="Ghost.TButton", command=self.load_selected).pack(side="right", padx=(0, 8))
         RoundButton(top, text="Supprimer la selection", style_name="Ghost.TButton", command=self.delete_selected).pack(side="right")
 
         export_bar = ttk.Frame(self.table_card, style="Surface.TFrame")
@@ -1612,7 +1943,7 @@ class ExpensesPage(FinancialEntryPage):
         RoundButton(export_bar, text="Exporter les depenses", style_name="Ghost.TButton", command=self.export_selected_month).pack(side="left")
 
         columns = ("date", "company", "source", "category", "ht", "ttc", "file", "added")
-        self.tree = ttk.Treeview(self.table_card, columns=columns, show="headings", height=18)
+        table_shell, self.tree = create_scrolled_treeview(self.table_card, columns=columns, height=18)
         headings = {
             "date": "Date",
             "company": "Entreprise",
@@ -1627,7 +1958,8 @@ class ExpensesPage(FinancialEntryPage):
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
-        self.tree.pack(fill="both", expand=True, pady=(0, 0))
+        table_shell.pack(fill="both", expand=True, pady=(0, 0))
+        self.tree.bind("<Double-1>", lambda _event: self.load_selected())
 
     def refresh(self) -> None:
         self.refresh_invoice_options()
@@ -1668,17 +2000,34 @@ class ExpensesPage(FinancialEntryPage):
         record = self.rows.get(selection[0], {})
         attachment = str(record.get("attachment_path", "")).strip()
         if not attachment:
-            messagebox.showwarning("Depense", "Aucune facture locale rattachee a cette depense.")
+            self.app.notify_warning("Depense", "Aucune piece jointe locale rattachee a cette depense.")
             return
         try:
-            webbrowser.open(Path(attachment).resolve().as_uri())
+            open_local_file(attachment, missing_message="La facture locale rattachee est introuvable.")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Depense", str(exc))
         except Exception:
-            messagebox.showerror("Depense", "Impossible d'ouvrir la facture de depense.")
+            self.app.notify_error("Depense", "Impossible d'ouvrir la piece jointe.")
+
+    def preview_selected_attachment(self) -> None:
+        record = self.selected_row()
+        if not record:
+            return
+        attachment = str(record.get("attachment_path", "")).strip()
+        if not attachment:
+            self.app.notify_warning("Depense", "Aucune piece jointe a previsualiser.")
+            return
+        try:
+            FilePreviewWindow(self.app, attachment, "Apercu de la piece jointe")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Depense", str(exc))
+        except Exception as exc:
+            self.app.notify_error("Depense", f"Impossible d'ouvrir l'apercu.\n\n{exc}")
 
     def export_selected_month(self) -> None:
         month_key = self.export_month_var.get().strip()
         if not month_key:
-            messagebox.showwarning("Export", "Choisissez un mois a exporter.")
+            self.app.notify_warning("Export", "Choisissez un mois a exporter.")
             return
         destination = filedialog.askdirectory(title="Choisir un dossier pour l'export des depenses")
         if not destination:
@@ -1690,19 +2039,15 @@ class ExpensesPage(FinancialEntryPage):
             Path(destination),
         )
         if export_result.missing_documents:
-            messagebox.showwarning(
+            self.app.notify_warning(
                 "Export depenses",
-                "L'export est termine, mais certaines factures locales etaient manquantes.\n\n"
-                f"Dossier: {export_result.export_root}\n"
-                f"Rapport: {export_result.report_path.name}\n"
-                f"Documents manquants: {len(export_result.missing_documents)}",
+                "Export termine avec des pieces jointes manquantes.\n\n"
+                f"Dossier: {export_result.export_root}\nRapport: {export_result.report_path.name}",
             )
             return
-        messagebox.showinfo(
+        self.app.notify_success(
             "Export depenses",
-            "Les depenses de "
-            f"{month_key} ont ete exportees dans un dossier separe:\n\n{export_result.export_root}\n\n"
-            f"Rapport genere: {export_result.report_path.name}",
+            f"Les depenses de {month_key} ont ete exportees dans {export_result.export_root}.",
         )
 
 
@@ -1711,10 +2056,12 @@ class EmployeeExpensesPage(BaseEntryPage):
         super().__init__(
             master,
             app,
-            "Paie employe",
-            "Centralisez salaires, primes, charges et remboursements pour suivre la vraie sante de l'entreprise.",
+            "Paie",
+            "Suivez les salaires, primes, remboursements et justificatifs associes dans un flux local unique.",
         )
         self.rows: dict[str, dict] = {}
+        self.employee_directory: dict[str, dict] = {}
+        self.editing_record_id: int | None = None
         self.export_month_var = tk.StringVar(master=app)
         self.date_var = tk.StringVar(value=date.today().isoformat())
         self.payroll_month_var = tk.StringVar(value=date.today().strftime("%Y-%m"))
@@ -1723,14 +2070,17 @@ class EmployeeExpensesPage(BaseEntryPage):
         self.amount_ht_var = tk.StringVar()
         self.amount_ttc_var = tk.StringVar()
         self.notes_var = tk.StringVar()
+        self.form_mode_var = tk.StringVar(value="Nouvelle depense employe")
+        self.employee_info_var = tk.StringVar(value="Selectionnez un employe ou saisissez un nom libre.")
         self.attachment_label_var = tk.StringVar(value="Aucun justificatif de paie selectionne")
         self.attachment_source_path = ""
+        self.attachment_existing_path = ""
 
         self._build_form()
         self._build_table()
 
     def _build_form(self) -> None:
-        ttk.Label(self.form_card, text="Nouvelle depense employe", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.form_card, textvariable=self.form_mode_var, style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
             self.form_card,
             text="Une ligne = un employe, un mois, un montant et un justificatif local si besoin.",
@@ -1749,7 +2099,11 @@ class EmployeeExpensesPage(BaseEntryPage):
         ]
         for index, (label, variable) in enumerate(fields, start=1):
             self._create_label(self.form_card, label, index * 2)
-            if label == "Type":
+            if label == "Employe":
+                widget = ttk.Combobox(self.form_card, textvariable=variable, state="normal")
+                widget.bind("<<ComboboxSelected>>", lambda _event: self.on_employee_change())
+                self.employee_widget = widget
+            elif label == "Type":
                 widget = ttk.Combobox(
                     self.form_card,
                     textvariable=variable,
@@ -1760,31 +2114,35 @@ class EmployeeExpensesPage(BaseEntryPage):
                 widget = ttk.Entry(self.form_card, textvariable=variable)
             widget.grid(row=index * 2 + 1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
-        self._create_label(self.form_card, "Justificatif local", 16)
+        ttk.Label(self.form_card, textvariable=self.employee_info_var, style="MutedSurface.TLabel", wraplength=280).grid(row=16, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        self._create_label(self.form_card, "Justificatif local", 17)
         file_actions = ttk.Frame(self.form_card, style="Surface.TFrame")
-        file_actions.grid(row=17, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        file_actions.grid(row=18, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         RoundButton(file_actions, text="Choisir un fichier", style_name="Ghost.TButton", command=self.pick_attachment).pack(side="left")
         RoundButton(file_actions, text="Ouvrir", style_name="Ghost.TButton", command=self.open_attachment).pack(side="left", padx=8)
         RoundButton(file_actions, text="Retirer", style_name="Ghost.TButton", command=self.clear_attachment).pack(side="left")
-        ttk.Label(self.form_card, textvariable=self.attachment_label_var, style="MutedSurface.TLabel", wraplength=280).grid(row=18, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(self.form_card, textvariable=self.attachment_label_var, style="MutedSurface.TLabel", wraplength=280).grid(row=19, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         actions = ttk.Frame(self.form_card, style="Surface.TFrame")
-        actions.grid(row=19, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        RoundButton(actions, text="Ajouter la depense employe", style_name="AccentAlt.TButton", command=self.add_record).pack(side="left")
-        RoundButton(actions, text="Vider", style_name="Ghost.TButton", command=self.clear_form).pack(side="left", padx=8)
+        actions.grid(row=20, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        RoundButton(actions, text="Enregistrer", style_name="AccentAlt.TButton", command=self.save_record).pack(side="left")
+        RoundButton(actions, text="Annuler l'edition", style_name="Ghost.TButton", command=self.clear_form).pack(side="left", padx=8)
         ttk.Label(
             self.form_card,
-            text="La paie est ajoutee dans la sante d'entreprise, le calendrier et les exports.",
+            text="Les justificatifs restent locaux et peuvent etre mis a jour plus tard.",
             style="MutedSurface.TLabel",
             wraplength=280,
-        ).grid(row=20, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(12, 0))
         self.form_card.columnconfigure(0, weight=1)
 
     def _build_table(self) -> None:
         top = ttk.Frame(self.table_card, style="Surface.TFrame")
         top.pack(fill="x")
         ttk.Label(top, text="Historique paie", style="SectionTitle.TLabel").pack(side="left")
+        RoundButton(top, text="Apercu", style_name="Ghost.TButton", command=self.preview_selected_attachment).pack(side="right", padx=(0, 8))
         RoundButton(top, text="Ouvrir le justificatif", style_name="Ghost.TButton", command=self.open_selected_attachment).pack(side="right", padx=(0, 8))
+        RoundButton(top, text="Modifier", style_name="Ghost.TButton", command=self.load_selected).pack(side="right", padx=(0, 8))
         RoundButton(top, text="Supprimer la selection", style_name="Ghost.TButton", command=self.delete_selected).pack(side="right")
 
         export_bar = ttk.Frame(self.table_card, style="Surface.TFrame")
@@ -1795,7 +2153,7 @@ class EmployeeExpensesPage(BaseEntryPage):
         RoundButton(export_bar, text="Exporter la paie", style_name="Ghost.TButton", command=self.export_selected_month).pack(side="left")
 
         columns = ("date", "employee", "label", "period", "ttc", "file", "added")
-        self.tree = ttk.Treeview(self.table_card, columns=columns, show="headings", height=18)
+        table_shell, self.tree = create_scrolled_treeview(self.table_card, columns=columns, height=18)
         headings = {
             "date": "Date",
             "employee": "Employe",
@@ -1809,7 +2167,8 @@ class EmployeeExpensesPage(BaseEntryPage):
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
-        self.tree.pack(fill="both", expand=True)
+        table_shell.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _event: self.load_selected())
 
     def pick_attachment(self) -> None:
         filename = filedialog.askopenfilename(
@@ -1819,21 +2178,37 @@ class EmployeeExpensesPage(BaseEntryPage):
         if filename:
             self.attachment_source_path = filename
             self.attachment_label_var.set(Path(filename).name)
+            self.attachment_existing_path = ""
 
     def open_attachment(self) -> None:
-        source = self.attachment_source_path.strip()
+        source = self.attachment_source_path.strip() or self.attachment_existing_path.strip()
         if not source:
             return
         try:
-            webbrowser.open(Path(source).resolve().as_uri())
+            open_local_file(source, missing_message="Le justificatif selectionne est introuvable.")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Paie", str(exc))
         except Exception:
-            messagebox.showerror("Paie", "Impossible d'ouvrir le justificatif selectionne.")
+            self.app.notify_error("Paie", "Impossible d'ouvrir le justificatif selectionne.")
 
     def clear_attachment(self) -> None:
         self.attachment_source_path = ""
+        self.attachment_existing_path = ""
         self.attachment_label_var.set("Aucun justificatif de paie selectionne")
 
+    def on_employee_change(self) -> None:
+        employee = self.employee_directory.get(self.employee_var.get().strip().lower())
+        if not employee:
+            self.employee_info_var.set("Selectionnez un employe ou saisissez un nom libre.")
+            return
+        self.employee_info_var.set(
+            f"{employee.get('role') or 'Role non renseigne'} | {employee.get('status') or 'Statut non renseigne'} | "
+            f"Brut {money(employee.get('gross_salary', 0))} | Net {money(employee.get('net_salary', 0))}"
+        )
+
     def clear_form(self) -> None:
+        self.editing_record_id = None
+        self.form_mode_var.set("Nouvelle depense employe")
         self.date_var.set(date.today().isoformat())
         self.payroll_month_var.set(date.today().strftime("%Y-%m"))
         self.employee_var.set("")
@@ -1841,9 +2216,35 @@ class EmployeeExpensesPage(BaseEntryPage):
         self.amount_ht_var.set("")
         self.amount_ttc_var.set("")
         self.notes_var.set("")
+        self.employee_info_var.set("Selectionnez un employe ou saisissez un nom libre.")
         self.clear_attachment()
 
-    def add_record(self) -> None:
+    def selected_row(self) -> dict | None:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        return self.rows.get(selection[0])
+
+    def load_selected(self) -> None:
+        record = self.selected_row()
+        if not record:
+            return
+        self.editing_record_id = int(record["id"])
+        self.form_mode_var.set(f"Modifier {record.get('expense_label') or 'la ligne'}")
+        self.date_var.set(record["expense_date"])
+        self.payroll_month_var.set(record.get("payroll_month") or "")
+        self.employee_var.set(record.get("employee_name") or record["company_name"])
+        self.label_var.set(record.get("expense_label") or "Salaire")
+        self.amount_ht_var.set(str(record["amount_ht"]))
+        self.amount_ttc_var.set(str(record["amount_ttc"]))
+        self.notes_var.set(record.get("notes", "") or "")
+        attachment = str(record.get("attachment_path", "")).strip()
+        self.attachment_source_path = ""
+        self.attachment_existing_path = attachment
+        self.attachment_label_var.set(Path(attachment).name if attachment else "Aucun justificatif de paie selectionne")
+        self.on_employee_change()
+
+    def save_record(self) -> None:
         copied_attachment = ""
         try:
             parse_iso_date(self.date_var.get())
@@ -1870,24 +2271,44 @@ class EmployeeExpensesPage(BaseEntryPage):
                 "notes": self.notes_var.get().strip(),
             }
             if self.attachment_source_path.strip():
-                copied_attachment = str(copy_expense_attachment(self.attachment_source_path))
+                copied_attachment = str(
+                    copy_expense_attachment(
+                        self.attachment_source_path,
+                        "employee_expense",
+                        employee_name,
+                        self.date_var.get(),
+                    )
+                )
                 payload["attachment_path"] = copied_attachment
+            elif self.attachment_existing_path.strip():
+                payload["attachment_path"] = self.attachment_existing_path.strip()
         except Exception as exc:
-            messagebox.showerror("Paie", f"Impossible d'enregistrer.\n\n{exc}")
+            self.app.notify_error("Paie", f"Impossible d'enregistrer.\n\n{exc}")
             return
 
         try:
-            self.app.db.add_expense(payload)
+            if self.editing_record_id is None:
+                self.app.db.add_expense(payload)
+            else:
+                self.app.db.update_expense(self.editing_record_id, payload)
         except Exception as exc:
             if copied_attachment:
                 Path(copied_attachment).unlink(missing_ok=True)
-            messagebox.showerror("Paie", f"Impossible d'enregistrer.\n\n{exc}")
+            self.app.notify_error("Paie", f"Impossible d'enregistrer.\n\n{exc}")
             return
 
+        self.app.notify_success(
+            "Paie",
+            "La ligne de paie a ete mise a jour." if self.editing_record_id is not None else "La ligne de paie a ete ajoutee.",
+        )
         self.clear_form()
         self.app.refresh_all_pages()
 
     def refresh(self) -> None:
+        employees = self.app.db.get_employees()
+        self.employee_directory = {employee["name"].strip().lower(): employee for employee in employees}
+        self.employee_widget.configure(values=[employee["name"] for employee in employees])
+        self.on_employee_change()
         self.rows.clear()
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1924,12 +2345,29 @@ class EmployeeExpensesPage(BaseEntryPage):
         record = self.rows.get(selection[0], {})
         attachment = str(record.get("attachment_path", "")).strip()
         if not attachment:
-            messagebox.showwarning("Paie", "Aucun justificatif local rattache a cette ligne.")
+            self.app.notify_warning("Paie", "Aucun justificatif local rattache a cette ligne.")
             return
         try:
-            webbrowser.open(Path(attachment).resolve().as_uri())
+            open_local_file(attachment, missing_message="Le justificatif local rattache est introuvable.")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Paie", str(exc))
         except Exception:
-            messagebox.showerror("Paie", "Impossible d'ouvrir le justificatif de paie.")
+            self.app.notify_error("Paie", "Impossible d'ouvrir le justificatif de paie.")
+
+    def preview_selected_attachment(self) -> None:
+        record = self.selected_row()
+        if not record:
+            return
+        attachment = str(record.get("attachment_path", "")).strip()
+        if not attachment:
+            self.app.notify_warning("Paie", "Aucun justificatif a previsualiser.")
+            return
+        try:
+            FilePreviewWindow(self.app, attachment, "Apercu du justificatif")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Paie", str(exc))
+        except Exception as exc:
+            self.app.notify_error("Paie", f"Impossible d'ouvrir l'apercu.\n\n{exc}")
 
     def delete_selected(self) -> None:
         selection = self.tree.selection()
@@ -1938,12 +2376,14 @@ class EmployeeExpensesPage(BaseEntryPage):
         if not messagebox.askyesno("Paie", "Supprimer la ligne selectionnee ?"):
             return
         self.app.db.delete_expense(int(selection[0]))
+        self.app.notify_success("Paie", "La ligne a ete supprimee.")
+        self.clear_form()
         self.app.refresh_all_pages()
 
     def export_selected_month(self) -> None:
         month_key = self.export_month_var.get().strip()
         if not month_key:
-            messagebox.showwarning("Export", "Choisissez un mois a exporter.")
+            self.app.notify_warning("Export", "Choisissez un mois a exporter.")
             return
         destination = filedialog.askdirectory(title="Choisir un dossier pour l'export de la paie")
         if not destination:
@@ -1955,18 +2395,15 @@ class EmployeeExpensesPage(BaseEntryPage):
             Path(destination),
         )
         if export_result.missing_documents:
-            messagebox.showwarning(
+            self.app.notify_warning(
                 "Export paie",
-                "L'export est termine, mais certains justificatifs locaux etaient manquants.\n\n"
-                f"Dossier: {export_result.export_root}\n"
-                f"Rapport: {export_result.report_path.name}\n"
-                f"Documents manquants: {len(export_result.missing_documents)}",
+                "Export termine avec des justificatifs manquants.\n\n"
+                f"Dossier: {export_result.export_root}\nRapport: {export_result.report_path.name}",
             )
             return
-        messagebox.showinfo(
+        self.app.notify_success(
             "Export paie",
-            f"La paie de {month_key} a ete exportee dans un dossier separe:\n\n{export_result.export_root}\n\n"
-            f"Rapport genere: {export_result.report_path.name}",
+            f"La paie de {month_key} a ete exportee dans {export_result.export_root}.",
         )
 
 
@@ -2001,12 +2438,16 @@ class DocumentPage(ttk.Frame):
 
     def _build_table(self) -> None:
         ttk.Label(self.table_card, text="Documents", style="SectionTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.table_card, text="HT, TTC, date du document, apercu et export mensuel local.", style="MutedSurface.TLabel").pack(anchor="w", pady=(2, 12))
+        ttk.Label(self.table_card, text="Liste locale, modification directe, ouverture HTML et export mensuel.", style="MutedSurface.TLabel").pack(anchor="w", pady=(2, 12))
 
         actions = ttk.Frame(self.table_card, style="Surface.TFrame")
         actions.pack(fill="x", pady=(0, 12))
         new_label = "Nouvelle facture" if self.kind == "invoice" else "Nouveau devis"
         RoundButton(actions, text=new_label, style_name="Accent.TButton", command=self.open_editor).pack(side="left")
+        RoundButton(actions, text="Modifier", style_name="Ghost.TButton", command=self.edit_selected).pack(side="left", padx=8)
+        if self.kind == "quote":
+            RoundButton(actions, text="Transformer en facture", style_name="Ghost.TButton", command=self.convert_selected).pack(side="left", padx=8)
+        RoundButton(actions, text="Apercu", style_name="Ghost.TButton", command=self.preview_selected_file).pack(side="left", padx=8)
         RoundButton(actions, text="Ouvrir HTML", style_name="Ghost.TButton", command=self.open_selected_html).pack(side="left", padx=8)
         RoundButton(actions, text="Supprimer", style_name="Danger.TButton", command=self.delete_selected).pack(side="right")
 
@@ -2032,7 +2473,7 @@ class DocumentPage(ttk.Frame):
             RoundButton(status_actions, text=label, style_name="Ghost.TButton", command=lambda value=label: self.change_status(value)).pack(side="left", padx=(0, 8))
 
         columns = ("number", "client", "date", "deadline", "added", "status", "ttc")
-        self.tree = ttk.Treeview(self.table_card, columns=columns, show="headings", height=18)
+        table_shell, self.tree = create_scrolled_treeview(self.table_card, columns=columns, height=18)
         headings = {
             "number": "Numero",
             "client": "Client",
@@ -2046,12 +2487,13 @@ class DocumentPage(ttk.Frame):
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
-        self.tree.pack(fill="both", expand=True)
+        table_shell.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _event: self.show_detail())
+        self.tree.bind("<Double-1>", lambda _event: self.edit_selected())
 
     def _build_detail(self) -> None:
         ttk.Label(self.detail_card, text="Apercu visuel", style="SectionTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.detail_card, text="Le document reste stocke localement sur la machine et peut etre ouvert en HTML.", style="MutedSurface.TLabel").pack(anchor="w", pady=(2, 12))
+        ttk.Label(self.detail_card, text="Le document reste modifiable et stocke localement sur la machine.", style="MutedSurface.TLabel").pack(anchor="w", pady=(2, 12))
 
         preview = ttk.Frame(self.detail_card, style="SurfaceSoft.TFrame", padding=16)
         preview.pack(fill="both", expand=True)
@@ -2066,11 +2508,16 @@ class DocumentPage(ttk.Frame):
         ttk.Label(preview, textvariable=self.preview_company_var, style="TableStrongSurface.TLabel").pack(anchor="w", pady=(0, 12))
         ttk.Label(preview, textvariable=self.preview_amounts_var, style="MetricMiniSoft.TLabel").pack(anchor="w", pady=(0, 12))
 
-        self.preview_items = ttk.Treeview(preview, columns=("description", "qty", "price", "total"), show="headings", height=8)
+        preview_items_shell, self.preview_items = create_scrolled_treeview(
+            preview,
+            columns=("description", "qty", "price", "total"),
+            height=8,
+            frame_style="SurfaceSoft.TFrame",
+        )
         for column, heading, width in [("description", "Description", 220), ("qty", "Qt", 50), ("price", "Prix HT", 90), ("total", "Total HT", 90)]:
             self.preview_items.heading(column, text=heading)
             self.preview_items.column(column, width=width, anchor="w")
-        self.preview_items.pack(fill="x", pady=(0, 12))
+        preview_items_shell.pack(fill="x", pady=(0, 12))
 
         ttk.Label(preview, text="Notes", style="SectionTitleSoft.TLabel").pack(anchor="w")
         self.preview_notes = tk.Text(preview, bg=COLOR_SURFACE_SOFT, bd=0, fg=COLOR_TEXT, height=5, font=(FONT_BODY, 10), wrap="word", highlightthickness=0)
@@ -2088,6 +2535,20 @@ class DocumentPage(ttk.Frame):
 
     def open_editor(self) -> None:
         DocumentEditor(self.app, self.kind)
+
+    def edit_selected(self) -> None:
+        record = self.selected_record()
+        if not record:
+            return
+        DocumentEditor(self.app, self.kind, record=record)
+
+    def convert_selected(self) -> None:
+        if self.kind != "quote":
+            return
+        record = self.selected_record()
+        if not record:
+            return
+        DocumentEditor(self.app, "invoice", source_record=record)
 
     def selected_record(self) -> dict | None:
         selection = self.tree.selection()
@@ -2154,7 +2615,7 @@ class DocumentPage(ttk.Frame):
     def export_selected_month(self) -> None:
         month_key = self.export_month_var.get().strip()
         if not month_key:
-            messagebox.showwarning("Export", "Choisissez un mois a exporter.")
+            self.app.notify_warning("Export", "Choisissez un mois a exporter.")
             return
         destination = filedialog.askdirectory(title=f"Choisir un dossier pour l'export des {'factures' if self.kind == 'invoice' else 'devis'}")
         if not destination:
@@ -2162,25 +2623,38 @@ class DocumentPage(ttk.Frame):
         kind = "invoice" if self.kind == "invoice" else "quote"
         export_result = export_month_bundle(kind, list(self.records.values()), month_key, Path(destination))
         if export_result.missing_documents:
-            messagebox.showwarning(
+            self.app.notify_warning(
                 "Export",
-                "L'export est termine, mais certains documents HTML etaient manquants.\n\n"
-                f"Dossier: {export_result.export_root}\n"
-                f"Rapport: {export_result.report_path.name}\n"
-                f"Documents manquants: {len(export_result.missing_documents)}",
+                "Export termine avec des documents HTML manquants.\n\n"
+                f"Dossier: {export_result.export_root}\nRapport: {export_result.report_path.name}",
             )
             return
-        messagebox.showinfo(
+        self.app.notify_success(
             "Export",
-            f"Les {'factures' if self.kind == 'invoice' else 'devis'} de {month_key} ont ete exportes dans un dossier separe:\n\n"
-            f"{export_result.export_root}\n\nRapport genere: {export_result.report_path.name}",
+            f"Les {'factures' if self.kind == 'invoice' else 'devis'} de {month_key} ont ete exportes dans {export_result.export_root}.",
         )
 
     def open_selected_html(self) -> None:
         record = self.selected_record()
         if not record:
             return
-        webbrowser.open(Path(record["html_path"]).as_uri())
+        try:
+            open_local_file(record["html_path"], missing_message="Le document HTML local est introuvable.")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Document", str(exc))
+        except Exception:
+            self.app.notify_error("Document", "Impossible d'ouvrir le document HTML local.")
+
+    def preview_selected_file(self) -> None:
+        record = self.selected_record()
+        if not record:
+            return
+        try:
+            FilePreviewWindow(self.app, record["html_path"], "Apercu du document")
+        except FileNotFoundError as exc:
+            self.app.notify_warning("Document", str(exc))
+        except Exception as exc:
+            self.app.notify_error("Document", f"Impossible d'ouvrir l'apercu.\n\n{exc}")
 
     def change_status(self, status: str) -> None:
         record = self.selected_record()
@@ -2190,6 +2664,7 @@ class DocumentPage(ttk.Frame):
             self.app.db.update_invoice_status(record["id"], status)
         else:
             self.app.db.update_quote_status(record["id"], status)
+        self.app.notify_success("Document", f"Le statut est passe a {status}.")
         self.app.refresh_all_pages()
 
     def delete_selected(self) -> None:
@@ -2202,6 +2677,7 @@ class DocumentPage(ttk.Frame):
             self.app.db.delete_invoice(record["id"])
         else:
             self.app.db.delete_quote(record["id"])
+        self.app.notify_success("Document", "Le document a ete supprime.")
         self.app.refresh_all_pages()
 
     def animate_in(self) -> None:
@@ -2220,6 +2696,11 @@ class CompanyPage(ttk.Frame):
         super().__init__(master, style="App.TFrame")
         self.app = app
         self.logo_var = tk.StringVar()
+        self.documents_root_var = tk.StringVar()
+        self.storage_preview_var = tk.StringVar()
+        self.employee_info_var = tk.StringVar(value="Ajoutez des employes pour faciliter la saisie de la paie.")
+        self.selected_employee_index: int | None = None
+        self.employees: list[dict] = []
 
         self.scroll_shell = ScrollableFrame(self, COLOR_BG)
         self.scroll_shell.pack(fill="both", expand=True)
@@ -2227,7 +2708,7 @@ class CompanyPage(ttk.Frame):
         head = ttk.Frame(self.scroll_shell.content, style="App.TFrame")
         head.pack(fill="x", padx=24, pady=(24, 12))
         ttk.Label(head, text="Parametres", style="PageTitle.TLabel").pack(anchor="w")
-        ttk.Label(head, text="Identite, documents et theme dans une zone plus simple et plus propre.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(head, text="Identite Noryven, documents, employes et theme dans une zone d'administration unique.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
 
         body = ttk.Frame(self.scroll_shell.content, style="App.TFrame")
         body.pack(fill="both", expand=True, padx=24, pady=(0, 24))
@@ -2256,31 +2737,45 @@ class CompanyPage(ttk.Frame):
             "default_quote_status": tk.StringVar(),
             "ui_theme": tk.StringVar(value="Clair"),
         }
+        self.employee_fields = {
+            "name": tk.StringVar(),
+            "role": tk.StringVar(),
+            "status": tk.StringVar(value="Actif"),
+            "gross_salary": tk.StringVar(value="0"),
+            "net_salary": tk.StringVar(value="0"),
+        }
 
         self._build_form()
         self._build_info_card()
+        self.documents_root_var.trace_add("write", lambda *_args: self.update_storage_preview())
 
     def _build_form(self) -> None:
-        ttk.Label(self.form_card, text="Parametres", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(self.form_card, text="Trois onglets, uniquement l'essentiel.", style="MutedSurface.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 12))
+        ttk.Label(self.form_card, text="Administration", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.form_card, text="Identite, preferences, stockage et employes.", style="MutedSurface.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 12))
 
         notebook = ttk.Notebook(self.form_card)
         notebook.grid(row=2, column=0, sticky="nsew")
         identity_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=14)
         documents_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=14)
+        storage_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=14)
+        employees_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=14)
         appearance_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=14)
         notebook.add(identity_tab, text="Societe")
         notebook.add(documents_tab, text="Documents")
-        notebook.add(appearance_tab, text="Theme")
+        notebook.add(storage_tab, text="Stockage")
+        notebook.add(employees_tab, text="Employes")
+        notebook.add(appearance_tab, text="Interface")
 
         self._build_identity_tab(identity_tab)
         self._build_documents_tab(documents_tab)
+        self._build_storage_tab(storage_tab)
+        self._build_employees_tab(employees_tab)
         self._build_appearance_tab(appearance_tab)
 
         actions = ttk.Frame(self.form_card, style="Surface.TFrame")
         actions.grid(row=3, column=0, sticky="ew", pady=(16, 0))
         RoundButton(actions, text="Enregistrer", style_name="Accent.TButton", command=self.save).pack(side="left")
-        RoundButton(actions, text="Logo Velora", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left", padx=8)
+        RoundButton(actions, text="Logo Noryven", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left", padx=8)
         self.form_card.columnconfigure(0, weight=1)
         self.form_card.rowconfigure(2, weight=1)
 
@@ -2317,6 +2812,7 @@ class CompanyPage(ttk.Frame):
         logo_actions = ttk.Frame(master, style="Surface.TFrame")
         logo_actions.grid(row=row_cursor + 1, column=1, sticky="e", padx=(12, 0))
         RoundButton(logo_actions, text="Parcourir", style_name="Ghost.TButton", command=self.pick_logo).pack(side="left")
+        RoundButton(logo_actions, text="Defaut", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left", padx=8)
         master.columnconfigure(0, weight=1)
         master.columnconfigure(1, weight=1)
 
@@ -2361,6 +2857,82 @@ class CompanyPage(ttk.Frame):
         master.columnconfigure(0, weight=1)
         master.columnconfigure(1, weight=1)
 
+    def _build_storage_tab(self, master) -> None:
+        ttk.Label(master, text="Dossier racine des documents", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(master, textvariable=self.documents_root_var).grid(row=1, column=0, columnspan=3, sticky="ew")
+        actions = ttk.Frame(master, style="Surface.TFrame")
+        actions.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        RoundButton(actions, text="Parcourir", style_name="Ghost.TButton", command=self.pick_documents_root).pack(side="left")
+        RoundButton(actions, text="Defaut", style_name="Ghost.TButton", command=self.use_default_documents_root).pack(side="left", padx=8)
+        RoundButton(actions, text="Ouvrir", style_name="Ghost.TButton", command=self.open_documents_root).pack(side="left")
+        ttk.Label(master, text="Arborescence cible", style="FieldLabel.TLabel").grid(row=3, column=0, sticky="w", pady=(14, 6))
+        ttk.Label(master, textvariable=self.storage_preview_var, style="MutedSurface.TLabel", justify="left", wraplength=520).grid(row=4, column=0, columnspan=3, sticky="w")
+        master.columnconfigure(0, weight=1)
+        master.columnconfigure(1, weight=1)
+        master.columnconfigure(2, weight=1)
+
+    def _build_employees_tab(self, master) -> None:
+        master.columnconfigure(0, weight=2)
+        master.columnconfigure(1, weight=3)
+
+        editor = ttk.Frame(master, style="Surface.TFrame")
+        editor.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        listing = ttk.Frame(master, style="Surface.TFrame")
+        listing.grid(row=0, column=1, sticky="nsew")
+
+        labels = [
+            ("Identite", "name"),
+            ("Poste / role", "role"),
+            ("Statut", "status"),
+            ("Salaire brut", "gross_salary"),
+            ("Salaire net verse", "net_salary"),
+        ]
+        row_cursor = 0
+        for label, key in labels:
+            ttk.Label(editor, text=label, style="FieldLabel.TLabel").grid(row=row_cursor, column=0, sticky="w", pady=(0 if row_cursor == 0 else 8, 6))
+            if key == "status":
+                widget = ttk.Combobox(editor, textvariable=self.employee_fields[key], values=["Actif", "CDD", "Freelance", "Temps partiel", "Suspendu"], state="readonly")
+            else:
+                widget = ttk.Entry(editor, textvariable=self.employee_fields[key])
+            widget.grid(row=row_cursor + 1, column=0, sticky="ew")
+            row_cursor += 2
+
+        ttk.Label(editor, text="Informations utiles a la paie", style="FieldLabel.TLabel").grid(row=row_cursor, column=0, sticky="w", pady=(8, 6))
+        self.employee_notes_text = tk.Text(editor, height=5, wrap="word", bd=0, highlightthickness=1, highlightbackground=COLOR_BORDER, relief="flat")
+        self.employee_notes_text.grid(row=row_cursor + 1, column=0, sticky="ew")
+        style_text_widget(self.employee_notes_text)
+        row_cursor += 2
+
+        editor_actions = ttk.Frame(editor, style="Surface.TFrame")
+        editor_actions.grid(row=row_cursor, column=0, sticky="ew", pady=(12, 0))
+        RoundButton(editor_actions, text="Ajouter / mettre a jour", style_name="Accent.TButton", command=self.upsert_employee).pack(side="left")
+        RoundButton(editor_actions, text="Vider", style_name="Ghost.TButton", command=self.clear_employee_form).pack(side="left", padx=8)
+        ttk.Label(editor, textvariable=self.employee_info_var, style="MutedSurface.TLabel", wraplength=260).grid(row=row_cursor + 1, column=0, sticky="w", pady=(10, 0))
+        editor.columnconfigure(0, weight=1)
+
+        ttk.Label(listing, text="Employes", style="SectionTitle.TLabel").pack(anchor="w")
+        employee_shell, self.employee_tree = create_scrolled_treeview(
+            listing,
+            columns=("name", "role", "status", "gross", "net"),
+            height=12,
+        )
+        for column, heading, width in [
+            ("name", "Nom", 170),
+            ("role", "Role", 150),
+            ("status", "Statut", 110),
+            ("gross", "Brut", 100),
+            ("net", "Net", 100),
+        ]:
+            self.employee_tree.heading(column, text=heading)
+            self.employee_tree.column(column, width=width, anchor="w")
+        employee_shell.pack(fill="both", expand=True, pady=(12, 12))
+        self.employee_tree.bind("<<TreeviewSelect>>", lambda _event: self.load_selected_employee())
+
+        list_actions = ttk.Frame(listing, style="Surface.TFrame")
+        list_actions.pack(fill="x")
+        RoundButton(list_actions, text="Charger", style_name="Ghost.TButton", command=self.load_selected_employee).pack(side="left")
+        RoundButton(list_actions, text="Supprimer", style_name="Danger.TButton", command=self.remove_selected_employee).pack(side="left", padx=8)
+
     def _build_appearance_tab(self, master) -> None:
         ttk.Label(master, text="Theme de l'interface", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w", pady=(8, 6))
         ttk.Combobox(master, textvariable=self.document_fields["ui_theme"], values=list(APP_THEMES), state="readonly").grid(row=1, column=0, sticky="ew")
@@ -2368,17 +2940,17 @@ class CompanyPage(ttk.Frame):
         quick = ttk.Frame(master, style="SurfaceSoft.TFrame", padding=14)
         quick.grid(row=2, column=0, sticky="ew", pady=(16, 0))
         ttk.Label(quick, text="Actions rapides", style="SectionTitleSoft.TLabel").pack(anchor="w")
-        ttk.Label(quick, text="Un clic pour passer du clair au sombre ou remettre le logo d'origine.", style="MutedSoft.TLabel", wraplength=320).pack(anchor="w", pady=(4, 10))
+        ttk.Label(quick, text="Bascule du theme et restauration du logo par defaut.", style="MutedSoft.TLabel", wraplength=320).pack(anchor="w", pady=(4, 10))
         buttons = ttk.Frame(quick, style="SurfaceSoft.TFrame")
         buttons.pack(fill="x")
         RoundButton(buttons, text="Clair", style_name="Ghost.TButton", command=lambda: self.document_fields["ui_theme"].set("Clair")).pack(side="left")
         RoundButton(buttons, text="Sombre", style_name="Ghost.TButton", command=lambda: self.document_fields["ui_theme"].set("Sombre")).pack(side="left", padx=8)
-        RoundButton(buttons, text="Logo Velora", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left")
+        RoundButton(buttons, text="Logo Noryven", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left")
         master.columnconfigure(0, weight=1)
 
     def _build_info_card(self) -> None:
-        ttk.Label(self.info_card, text="Resume", style="SectionTitle.TLabel").pack(anchor="w")
-        ttk.Label(self.info_card, text="Un panneau court avec les actions utiles et le stockage local.", style="MutedSurface.TLabel", wraplength=280).pack(anchor="w", pady=(4, 12))
+        ttk.Label(self.info_card, text="Vue rapide", style="SectionTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.info_card, text="Acces directs et emplacements locaux utiles.", style="MutedSurface.TLabel", wraplength=280).pack(anchor="w", pady=(4, 12))
 
         quick_actions = ttk.Frame(self.info_card, style="SurfaceSoft.TFrame", padding=14)
         quick_actions.pack(fill="x", pady=(0, 12))
@@ -2387,30 +2959,32 @@ class CompanyPage(ttk.Frame):
         action_buttons.pack(fill="x", pady=(10, 0))
         RoundButton(action_buttons, text="Theme clair", style_name="Ghost.TButton", command=lambda: self.document_fields["ui_theme"].set("Clair")).pack(side="left")
         RoundButton(action_buttons, text="Theme sombre", style_name="Ghost.TButton", command=lambda: self.document_fields["ui_theme"].set("Sombre")).pack(side="left", padx=8)
-        RoundButton(action_buttons, text="Logo Velora", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left")
+        RoundButton(action_buttons, text="Logo Noryven", style_name="Ghost.TButton", command=self.use_default_logo).pack(side="left")
 
         storage = storage_root()
         local_block = ttk.Frame(self.info_card, style="SurfaceSoft.TFrame", padding=14)
         local_block.pack(fill="x", pady=6)
-        ttk.Label(local_block, text="Stockage local", style="TableStrongSurface.TLabel").pack(anchor="w")
-        ttk.Label(local_block, text=str(storage), style="MutedSoft.TLabel", wraplength=260).pack(anchor="w", pady=(4, 0))
+        ttk.Label(local_block, text="Base locale", style="TableStrongSurface.TLabel").pack(anchor="w")
+        ttk.Label(local_block, text=str(storage), style="MutedSoft.TLabel", wraplength=260).pack(anchor="w", pady=(4, 8))
+        RoundButton(local_block, text="Ouvrir", style_name="Ghost.TButton", command=lambda: open_local_file(storage)).pack(anchor="w")
 
         docs_block = ttk.Frame(self.info_card, style="SurfaceSoft.TFrame", padding=14)
         docs_block.pack(fill="x", pady=6)
-        ttk.Label(docs_block, text="Dossiers utiles", style="TableStrongSurface.TLabel").pack(anchor="w")
+        ttk.Label(docs_block, text="Documents", style="TableStrongSurface.TLabel").pack(anchor="w")
         ttk.Label(
             docs_block,
-            text="factures, devis, depenses et paie restent sur cette machine.",
+            textvariable=self.documents_root_var,
             style="MutedSoft.TLabel",
             wraplength=260,
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(anchor="w", pady=(4, 8))
+        RoundButton(docs_block, text="Ouvrir le dossier", style_name="Ghost.TButton", command=self.open_documents_root).pack(anchor="w")
 
         reset_block = ttk.Frame(self.info_card, style="SurfaceSoft.TFrame", padding=14)
         reset_block.pack(fill="x", pady=6)
         ttk.Label(reset_block, text="Remise a zero", style="TableStrongSurface.TLabel").pack(anchor="w")
         ttk.Label(
             reset_block,
-            text="Supprime toutes les donnees locales, les graphiques, les factures, les devis et les depenses sans reinstaller le logiciel.",
+            text="Supprime les donnees locales du logiciel, les documents et les parametres enregistres.",
             style="MutedSoft.TLabel",
             wraplength=260,
         ).pack(anchor="w", pady=(4, 10))
@@ -2422,20 +2996,128 @@ class CompanyPage(ttk.Frame):
             self.logo_var.set(filename)
 
     def use_default_logo(self) -> None:
-        self.logo_var.set(str(asset_path("velora_logo.png")))
+        self.logo_var.set(str(asset_path("noryven_logo.svg")))
+
+    def pick_documents_root(self) -> None:
+        directory = filedialog.askdirectory(title="Choisir le dossier racine des documents")
+        if directory:
+            self.documents_root_var.set(directory)
+
+    def use_default_documents_root(self) -> None:
+        self.documents_root_var.set(str(default_documents_root()))
+
+    def open_documents_root(self) -> None:
+        try:
+            open_local_file(self.documents_root_var.get().strip() or documents_root())
+        except Exception as exc:
+            self.app.notify_error("Stockage", f"Impossible d'ouvrir le dossier.\n\n{exc}")
+
+    def update_storage_preview(self) -> None:
+        base = Path(self.documents_root_var.get().strip() or documents_root()).expanduser()
+        self.storage_preview_var.set(
+            "\n".join(
+                [
+                    str(base / "devis"),
+                    str(base / "factures"),
+                    str(base / "depenses"),
+                    str(base / "paie"),
+                    str(base / "recettes"),
+                ]
+            )
+        )
+
+    def clear_employee_form(self) -> None:
+        self.selected_employee_index = None
+        self.employee_fields["name"].set("")
+        self.employee_fields["role"].set("")
+        self.employee_fields["status"].set("Actif")
+        self.employee_fields["gross_salary"].set("0")
+        self.employee_fields["net_salary"].set("0")
+        self.employee_notes_text.delete("1.0", "end")
+        self.employee_info_var.set("Ajoutez des employes pour faciliter la saisie de la paie.")
+
+    def refresh_employee_tree(self) -> None:
+        for item in self.employee_tree.get_children():
+            self.employee_tree.delete(item)
+        for index, employee in enumerate(self.employees):
+            self.employee_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    employee["name"],
+                    employee.get("role", ""),
+                    employee.get("status", ""),
+                    money(employee.get("gross_salary", 0)),
+                    money(employee.get("net_salary", 0)),
+                ),
+            )
+
+    def load_selected_employee(self) -> None:
+        selection = self.employee_tree.selection()
+        if not selection:
+            return
+        self.selected_employee_index = int(selection[0])
+        employee = self.employees[self.selected_employee_index]
+        for key in ("name", "role", "status"):
+            self.employee_fields[key].set(employee.get(key, ""))
+        self.employee_fields["gross_salary"].set(str(employee.get("gross_salary", 0)))
+        self.employee_fields["net_salary"].set(str(employee.get("net_salary", 0)))
+        self.employee_notes_text.delete("1.0", "end")
+        self.employee_notes_text.insert("1.0", employee.get("payroll_notes", ""))
+        self.employee_info_var.set(f"Edition de {employee['name']}.")
+
+    def upsert_employee(self) -> None:
+        try:
+            employee = {
+                "name": self.employee_fields["name"].get().strip(),
+                "role": self.employee_fields["role"].get().strip(),
+                "status": self.employee_fields["status"].get().strip() or "Actif",
+                "gross_salary": parse_amount(self.employee_fields["gross_salary"].get()),
+                "net_salary": parse_amount(self.employee_fields["net_salary"].get()),
+                "payroll_notes": self.employee_notes_text.get("1.0", "end").strip(),
+            }
+            employee = self.app.db._validate_employee(employee)
+        except Exception as exc:
+            self.app.notify_error("Employes", f"Impossible d'enregistrer l'employe.\n\n{exc}")
+            return
+
+        duplicate_index = next(
+            (index for index, current in enumerate(self.employees) if current["name"].strip().lower() == employee["name"].strip().lower()),
+            None,
+        )
+        if duplicate_index is not None and duplicate_index != self.selected_employee_index:
+            self.app.notify_warning("Employes", "Un employe avec ce nom existe deja.")
+            return
+        if self.selected_employee_index is None:
+            self.employees.append(employee)
+        else:
+            self.employees[self.selected_employee_index] = employee
+        self.refresh_employee_tree()
+        self.clear_employee_form()
+        self.app.notify_success("Employes", "La fiche employe a ete mise a jour.")
+
+    def remove_selected_employee(self) -> None:
+        selection = self.employee_tree.selection()
+        if not selection:
+            return
+        if not messagebox.askyesno("Employes", "Supprimer cet employe de la liste ?"):
+            return
+        self.employees.pop(int(selection[0]))
+        self.refresh_employee_tree()
+        self.clear_employee_form()
+        self.app.notify_success("Employes", "L'employe a ete retire de la liste.")
 
     def reset_software(self) -> None:
         confirmed = messagebox.askokcancel(
             "Remise a zero",
-            "Attention.\n\nCette action va supprimer toutes les donnees du logiciel sur cette machine:\n"
-            "- factures\n- devis\n- recettes\n- depenses\n- paie\n- todo liste\n- parametres enregistres\n\n"
-            "Confirmer pour repartir de zero, ou Annuler pour garder les donnees.",
+            "Cette action va supprimer les donnees locales du logiciel sur cette machine.\n\nConfirmez uniquement si vous voulez repartir d'une base vide.",
             icon="warning",
         )
         if not confirmed:
             return
         self.app.db.reset_all_data()
-        messagebox.showinfo("Remise a zero", "Toutes les donnees locales du logiciel ont ete supprimees. Velora repart maintenant de zero.")
+        self.app.notify_success("Remise a zero", "Toutes les donnees locales ont ete supprimees.")
         self.app.apply_theme("Clair", keep_page="company")
 
     def save(self) -> None:
@@ -2462,14 +3144,22 @@ class CompanyPage(ttk.Frame):
                 raise ValueError("Les delais doivent etre positifs.")
             if preferences["ui_theme"] not in APP_THEMES:
                 raise ValueError("Le theme choisi est invalide.")
+            target_documents_root = set_documents_root(self.documents_root_var.get().strip() or documents_root())
+            self.app.db.save_employees(self.employees)
         except Exception as exc:
-            messagebox.showerror("Parametres", f"Impossible d'enregistrer les parametres.\n\n{exc}")
+            self.app.notify_error("Parametres", f"Impossible d'enregistrer les parametres.\n\n{exc}")
+            return
+
+        try:
+            self.app.db.save_company_profile(profile)
+            self.app.db.save_document_preferences(preferences)
+        except Exception as exc:
+            self.app.notify_error("Parametres", f"Impossible d'enregistrer les parametres.\n\n{exc}")
             return
 
         theme_changed = self.app.current_theme != preferences["ui_theme"]
-        self.app.db.save_company_profile(profile)
-        self.app.db.save_document_preferences(preferences)
-        messagebox.showinfo("Parametres", "Les informations entreprise et les reglages de documents ont bien ete enregistres.")
+        self.documents_root_var.set(str(target_documents_root))
+        self.app.notify_success("Parametres", "Les reglages ont ete enregistres.")
         if theme_changed:
             self.app.apply_theme(preferences["ui_theme"], keep_page="company")
         else:
@@ -2493,6 +3183,13 @@ class CompanyPage(ttk.Frame):
         self.default_quote_notes_text.delete("1.0", "end")
         self.default_quote_notes_text.insert("1.0", preferences.get("default_quote_notes", ""))
         self.logo_var.set(profile.get("logo_path", ""))
+        try:
+            self.documents_root_var.set(str(documents_root()))
+        except Exception:
+            self.documents_root_var.set(str(default_documents_root()))
+        self.employees = self.app.db.get_employees()
+        self.refresh_employee_tree()
+        self.clear_employee_form()
 
     def animate_in(self) -> None:
         pulse_panel(self.form_card)
@@ -2554,13 +3251,13 @@ class TodoPage(BaseEntryPage):
         RoundButton(top, text="Supprimer", style_name="Danger.TButton", command=self.delete_selected).pack(side="right")
 
         columns = ("date", "time", "title", "status", "added")
-        self.tree = ttk.Treeview(self.table_card, columns=columns, show="headings", height=16)
+        table_shell, self.tree = create_scrolled_treeview(self.table_card, columns=columns, height=16)
         headings = {"date": "Date", "time": "Heure", "title": "Titre", "status": "Statut", "added": "Ajout"}
         widths = {"date": 95, "time": 70, "title": 220, "status": 100, "added": 130}
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
-        self.tree.pack(fill="both", expand=True, pady=(12, 0))
+        table_shell.pack(fill="both", expand=True, pady=(12, 0))
         self.tree.bind("<<TreeviewSelect>>", lambda _event: self.load_selected())
 
     def _payload(self) -> dict:
@@ -2581,9 +3278,10 @@ class TodoPage(BaseEntryPage):
         try:
             self.app.db.add_todo(self._payload())
         except Exception as exc:
-            messagebox.showerror("Todo", f"Impossible d'ajouter la tache.\n\n{exc}")
+            self.app.notify_error("Todo", f"Impossible d'ajouter la tache.\n\n{exc}")
             return
         self.clear_form()
+        self.app.notify_success("Todo", "La tache a ete ajoutee.")
         self.app.refresh_all_pages()
 
     def update_todo(self) -> None:
@@ -2592,9 +3290,10 @@ class TodoPage(BaseEntryPage):
         try:
             self.app.db.update_todo(self.selected_todo_id, self._payload())
         except Exception as exc:
-            messagebox.showerror("Todo", f"Impossible de modifier la tache.\n\n{exc}")
+            self.app.notify_error("Todo", f"Impossible de modifier la tache.\n\n{exc}")
             return
         self.clear_form()
+        self.app.notify_success("Todo", "La tache a ete mise a jour.")
         self.app.refresh_all_pages()
 
     def delete_selected(self) -> None:
@@ -2605,6 +3304,7 @@ class TodoPage(BaseEntryPage):
             return
         self.app.db.delete_todo(int(selection[0]))
         self.clear_form()
+        self.app.notify_success("Todo", "La tache a ete supprimee.")
         self.app.refresh_all_pages()
 
     def load_selected(self) -> None:
@@ -2832,29 +3532,47 @@ class CalendarPage(ttk.Frame):
 
 
 class DocumentEditor(tk.Toplevel):
-    def __init__(self, app: "VeloraApp", kind: str) -> None:
+    def __init__(self, app: "VeloraApp", kind: str, record: dict | None = None, source_record: dict | None = None) -> None:
         super().__init__(app)
         self.app = app
         self.kind = kind
+        self.record = record
+        self.source_record = source_record
+        self.is_edit_mode = record is not None
         self.items: list[dict] = []
         self.company_profile = self.app.db.get_company_profile()
         self.document_preferences = self.app.db.get_document_preferences()
 
-        self.title("Nouvelle facture" if kind == "invoice" else "Nouveau devis")
+        if self.is_edit_mode:
+            self.title("Modifier la facture" if kind == "invoice" else "Modifier le devis")
+        elif source_record is not None and kind == "invoice":
+            self.title("Transformer le devis en facture")
+        else:
+            self.title("Nouvelle facture" if kind == "invoice" else "Nouveau devis")
         self.geometry("1080x760")
         self.minsize(980, 700)
         self.configure(bg=COLOR_BG)
         self.transient(app)
         self.grab_set()
 
-        self.number_var = tk.StringVar(value=self.app.db.next_document_number(kind))
-        self.issue_date_var = tk.StringVar(value=date.today().isoformat())
+        initial_number = record["number"] if record else self.app.db.next_document_number(kind)
+        if source_record is not None and kind == "invoice":
+            initial_number = self.app.db.next_document_number("invoice")
+        initial_issue_date = record["issue_date"] if record else date.today().isoformat()
+        if source_record is not None and kind == "invoice":
+            initial_issue_date = source_record["issue_date"]
+        self.number_var = tk.StringVar(value=initial_number)
+        self.issue_date_var = tk.StringVar(value=initial_issue_date)
         default_status = self.document_preferences["default_invoice_status"] if kind == "invoice" else self.document_preferences["default_quote_status"]
+        if record:
+            default_status = record["status"]
+        elif source_record is not None and kind == "invoice":
+            default_status = self.document_preferences["default_invoice_status"]
         self.status_var = tk.StringVar(value=default_status)
-        self.tax_rate_var = tk.StringVar(value=str(self.document_preferences["default_tax_rate"]))
-        self.client_name_var = tk.StringVar(value=self.document_preferences["default_client_name"])
-        self.client_email_var = tk.StringVar(value=self.document_preferences["default_client_email"])
-        self.client_address_var = tk.StringVar(value=self.document_preferences["default_client_address"])
+        self.tax_rate_var = tk.StringVar(value=str(record["tax_rate"] if record else source_record["tax_rate"] if source_record else self.document_preferences["default_tax_rate"]))
+        self.client_name_var = tk.StringVar(value=record["client_name"] if record else source_record["client_name"] if source_record else self.document_preferences["default_client_name"])
+        self.client_email_var = tk.StringVar(value=record.get("client_email", "") if record else source_record.get("client_email", "") if source_record else self.document_preferences["default_client_email"])
+        self.client_address_var = tk.StringVar(value=record.get("client_address", "") if record else source_record.get("client_address", "") if source_record else self.document_preferences["default_client_address"])
         self.description_var = tk.StringVar()
         self.quantity_var = tk.StringVar(value="1")
         self.unit_price_var = tk.StringVar(value="0")
@@ -2863,10 +3581,18 @@ class DocumentEditor(tk.Toplevel):
         self.tax_amount_var = tk.StringVar(value=money(0))
         self.tax_rate_var.trace_add("write", lambda *_args: self.update_totals())
         if kind == "invoice":
-            self.period_var = tk.StringVar(value=(date.today() + timedelta(days=int(self.document_preferences["invoice_due_days"]))).isoformat())
+            default_due_date = (date.today() + timedelta(days=int(self.document_preferences["invoice_due_days"]))).isoformat()
+            if record:
+                default_due_date = record["due_date"]
+            elif source_record is not None:
+                default_due_date = source_record.get("valid_until", default_due_date)
+            self.period_var = tk.StringVar(value=default_due_date)
         else:
             self.validity_days_var = tk.StringVar(value=str(self.document_preferences["quote_validity_days"]))
-            self.period_var = tk.StringVar(value=(date.today() + timedelta(days=int(self.document_preferences["quote_validity_days"]))).isoformat())
+            default_valid_until = (date.today() + timedelta(days=int(self.document_preferences["quote_validity_days"]))).isoformat()
+            if record:
+                default_valid_until = record["valid_until"]
+            self.period_var = tk.StringVar(value=default_valid_until)
             self.validity_days_var.trace_add("write", lambda *_args: self.update_valid_until())
             self.issue_date_var.trace_add("write", lambda *_args: self.update_valid_until())
 
@@ -2888,10 +3614,20 @@ class DocumentEditor(tk.Toplevel):
         self._build_left(self.left_panel)
         self._build_right(self.right_panel)
         self._build_bottom(self.bottom_panel)
-        if self.kind == "invoice":
+        if record:
+            self.notes_text.insert("1.0", record.get("notes", ""))
+        elif source_record is not None:
+            self.notes_text.insert("1.0", source_record.get("notes", ""))
+        elif self.kind == "invoice":
             self.notes_text.insert("1.0", self.document_preferences.get("default_invoice_notes", ""))
         else:
             self.notes_text.insert("1.0", self.document_preferences.get("default_quote_notes", ""))
+        if record:
+            self.items = [dict(item) for item in record["items"]]
+            self.refresh_items()
+        elif source_record is not None:
+            self.items = [dict(item) for item in source_record["items"]]
+            self.refresh_items()
         self.update_totals()
         self._bind_shortcuts()
         self.after(40, lambda: pulse_panel(self.left_panel, 20))
@@ -2924,7 +3660,7 @@ class DocumentEditor(tk.Toplevel):
         ttk.Label(master, text="Informations du document", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
             master,
-            text="Un formulaire plus direct, pense pour aller vite sans perdre le rendu final.",
+            text="Edition complete du document avec conservation des lignes et des donnees utiles.",
             style="MutedSurface.TLabel",
             wraplength=460,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 10))
@@ -2959,11 +3695,11 @@ class DocumentEditor(tk.Toplevel):
         RoundButton(master, text="Ajouter la ligne", style_name="Accent.TButton", command=self.add_item).grid(row=start_row + 10, column=1, sticky="ew", pady=(24, 0))
 
         columns = ("description", "quantity", "price", "total")
-        self.items_tree = ttk.Treeview(master, columns=columns, show="headings", height=8)
+        items_shell, self.items_tree = create_scrolled_treeview(master, columns=columns, height=8)
         for column, heading, width in [("description", "Description", 260), ("quantity", "Qt", 60), ("price", "Prix HT", 100), ("total", "Total HT", 100)]:
             self.items_tree.heading(column, text=heading)
             self.items_tree.column(column, width=width, anchor="w")
-        self.items_tree.grid(row=start_row + 11, column=0, columnspan=2, sticky="nsew", pady=(12, 8))
+        items_shell.grid(row=start_row + 11, column=0, columnspan=2, sticky="nsew", pady=(12, 8))
         RoundButton(master, text="Retirer la ligne", style_name="Ghost.TButton", command=self.remove_item).grid(row=start_row + 12, column=0, sticky="w")
         master.columnconfigure((0, 1), weight=1)
 
@@ -3008,7 +3744,10 @@ class DocumentEditor(tk.Toplevel):
         actions = ttk.Frame(master, style="Surface.TFrame")
         actions.pack(fill="x", pady=(16, 0))
         RoundButton(actions, text="Fermer", style_name="Ghost.TButton", command=self.destroy).pack(side="left")
-        RoundButton(actions, text="Generer et enregistrer", style_name="Accent.TButton", command=self.save).pack(side="right")
+        action_label = "Mettre a jour" if self.is_edit_mode else ("Creer la facture" if self.kind == "invoice" else "Creer le devis")
+        if self.source_record is not None and self.kind == "invoice":
+            action_label = "Creer la facture"
+        RoundButton(actions, text=action_label, style_name="Accent.TButton", command=self.save).pack(side="right")
 
     def update_valid_until(self) -> None:
         try:
@@ -3021,7 +3760,7 @@ class DocumentEditor(tk.Toplevel):
     def add_item(self) -> None:
         description = self.description_var.get().strip()
         if not description:
-            messagebox.showwarning("Ligne", "Ajoutez une description de ligne.")
+            self.app.notify_warning("Ligne", "Ajoutez une description de ligne.")
             return
         try:
             quantity = parse_amount(self.quantity_var.get())
@@ -3031,7 +3770,7 @@ class DocumentEditor(tk.Toplevel):
             if unit_price < 0:
                 raise ValueError("Le prix unitaire doit etre positif.")
         except Exception as exc:
-            messagebox.showerror("Ligne", f"Impossible d'ajouter la ligne.\n\n{exc}")
+            self.app.notify_error("Ligne", f"Impossible d'ajouter la ligne.\n\n{exc}")
             return
         self.items.append({"description": description, "quantity": quantity, "unit_price": unit_price})
         self.description_var.set("")
@@ -3070,7 +3809,7 @@ class DocumentEditor(tk.Toplevel):
 
     def save(self) -> None:
         if not self.items:
-            messagebox.showwarning("Document", "Ajoutez au moins une ligne avant de generer le document.")
+            self.app.notify_warning("Document", "Ajoutez au moins une ligne avant d'enregistrer le document.")
             return
         created_id: int | None = None
         try:
@@ -3089,12 +3828,16 @@ class DocumentEditor(tk.Toplevel):
             validate_tax_rate(tax_rate)
             tax_amount = subtotal * (tax_rate / 100)
             total = subtotal + tax_amount
-            html_path = document_target_path(self.kind, number)
+            client_name = self.client_name_var.get().strip() or "Client"
+            if self.record and str(self.record.get("html_path", "")).strip():
+                html_path = resolve_local_path(self.record["html_path"])
+            else:
+                html_path = document_target_path(self.kind, client_name, self.issue_date_var.get(), ".html")
             payload = {
                 "number": number,
                 "issue_date": self.issue_date_var.get().strip(),
                 "status": self.status_var.get().strip(),
-                "client_name": self.client_name_var.get().strip() or "Client",
+                "client_name": client_name,
                 "client_email": self.client_email_var.get().strip(),
                 "client_address": self.client_address_var.get().strip(),
                 "items": self.items,
@@ -3109,14 +3852,22 @@ class DocumentEditor(tk.Toplevel):
             }
             if self.kind == "invoice":
                 payload["due_date"] = deadline
-                created_id = self.app.db.create_invoice(payload)
+                if self.is_edit_mode:
+                    self.app.db.update_invoice(self.record["id"], payload)
+                else:
+                    created_id = self.app.db.create_invoice(payload)
                 save_document_html("invoice", payload, html_path)
+                if self.source_record is not None:
+                    self.app.db.update_quote_status(self.source_record["id"], "Accepte")
             else:
                 payload["valid_until"] = deadline
-                created_id = self.app.db.create_quote(payload)
+                if self.is_edit_mode:
+                    self.app.db.update_quote(self.record["id"], payload)
+                else:
+                    created_id = self.app.db.create_quote(payload)
                 save_document_html("quote", payload, html_path)
         except Exception as exc:
-            if created_id is not None:
+            if created_id is not None and not self.is_edit_mode:
                 try:
                     if self.kind == "invoice":
                         self.app.db.delete_invoice(created_id)
@@ -3124,23 +3875,38 @@ class DocumentEditor(tk.Toplevel):
                         self.app.db.delete_quote(created_id)
                 except Exception:
                     pass
-            messagebox.showerror("Document", f"Impossible de generer le document.\n\n{exc}")
+            self.app.notify_error("Document", f"Impossible d'enregistrer le document.\n\n{exc}")
             return
 
         self.app.refresh_all_pages()
-        webbrowser.open(Path(html_path).as_uri())
-        messagebox.showinfo("Document", "Le document a ete genere localement et ouvert dans votre navigateur.")
+        try:
+            open_local_file(html_path, missing_message="Le document genere est introuvable.")
+        except Exception as exc:
+            self.app.notify_warning(
+                "Document",
+                "Le document a ete enregistre localement, mais son ouverture automatique a echoue.\n\n"
+                f"{exc}",
+            )
+        else:
+            self.app.notify_success(
+                "Document",
+                "Le document a ete mis a jour." if self.is_edit_mode else "Le document a ete enregistre et ouvert.",
+            )
         self.destroy()
 
 
-class VeloraApp(tk.Tk):
+class NoryvenApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.db = Database()
         self.current_theme = apply_runtime_palette(self.db.get_document_preferences().get("ui_theme", "Clair"))
         self.title(APP_NAME)
-        self.geometry("1500x940")
-        self.minsize(1320, 840)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        initial_width = max(min(1500, screen_width - 80), min(980, screen_width))
+        initial_height = max(min(940, screen_height - 120), min(720, screen_height))
+        self.geometry(f"{initial_width}x{initial_height}")
+        self.minsize(min(initial_width, 1080), min(initial_height, 720))
         self.configure(bg=COLOR_BG)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -3152,10 +3918,32 @@ class VeloraApp(tk.Tk):
 
     def _load_logo(self) -> None:
         self.logo_image = None
-        png_path = asset_path("velora_logo.png")
+        png_path = asset_path("noryven_logo.png")
         if png_path.exists():
             self.logo_image = tk.PhotoImage(file=str(png_path))
             self.iconphoto(True, self.logo_image)
+
+    def notify(self, title: str, message: str, level: str = "info", duration_ms: int = 3600) -> None:
+        if not hasattr(self, "toast_host"):
+            return
+        toast = InlineToast(self.toast_host, title, message, level, self._close_toast)
+        toast.pack(fill="x", pady=(0, 10))
+        self.after(duration_ms, toast.close)
+
+    def _close_toast(self, toast) -> None:
+        try:
+            toast.destroy()
+        except Exception:
+            return
+
+    def notify_success(self, title: str, message: str) -> None:
+        self.notify(title, message, "success")
+
+    def notify_warning(self, title: str, message: str) -> None:
+        self.notify(title, message, "warning")
+
+    def notify_error(self, title: str, message: str) -> None:
+        self.notify(title, message, "error", 4800)
 
     def _bind_shortcuts(self) -> None:
         navigation = [
@@ -3174,6 +3962,8 @@ class VeloraApp(tk.Tk):
 
         self.bind_all("<F5>", lambda _event: self._shortcut_refresh())
         self.bind_all("<MouseWheel>", self._shortcut_mousewheel)
+        self.bind_all("<Button-4>", self._shortcut_mousewheel)
+        self.bind_all("<Button-5>", self._shortcut_mousewheel)
         for sequence, step in [("<Next>", 1), ("<KP_Next>", 1), ("<Prior>", -1), ("<KP_Prior>", -1)]:
             self.bind_all(sequence, lambda _event, pages=step: self._shortcut_scroll_pages(pages))
         for sequence, step in [("<KP_Down>", 6), ("<KP_Up>", -6)]:
@@ -3196,34 +3986,67 @@ class VeloraApp(tk.Tk):
         return False
 
     def _shortcut_mousewheel(self, event) -> str:
-        try:
-            if event.widget.winfo_toplevel() is not self:
-                return ""
-        except Exception:
-            return ""
-        delta = int(getattr(event, "delta", 0))
-        units = -int(delta / 120) if delta else 0
-        if units == 0:
-            units = -1 if delta > 0 else 1
-        if hasattr(self, "sidebar") and self._is_descendant(event.widget, self.sidebar):
-            if hasattr(self, "sidebar_scroll"):
-                self.sidebar_scroll.scroll_units(units * 3)
-                return "break"
-        return self._shortcut_scroll_units(units * 3)
+        return self.route_mousewheel(event)
 
-    def _shortcut_scroll_units(self, units: int) -> str:
+    def route_mousewheel(self, event) -> str:
+        units = normalized_mousewheel_units(event)
+        if units == 0:
+            return ""
+        return self._dispatch_scroll_units(getattr(event, "widget", None), units * 3)
+
+    def _focused_widget(self):
+        try:
+            return self.focus_get()
+        except Exception:
+            return None
+
+    def _find_scroll_host(self, widget):
+        current = widget
+        while current is not None:
+            if current is not self and hasattr(current, "scroll_units"):
+                return current
+            current = getattr(current, "master", None)
+
         active_page = self.pages.get(self.active_page)
         if active_page and hasattr(active_page, "scroll_units"):
-            active_page.scroll_units(units)
+            return active_page
+        return None
+
+    def _scroll_overflow_widget(self, widget, units: int) -> bool:
+        current = widget
+        while current is not None:
+            if widget_supports_yview(current) and widget_has_vertical_overflow(current):
+                try:
+                    current.yview_scroll(units, "units")
+                    return True
+                except Exception:
+                    return False
+            if current is not self and hasattr(current, "scroll_units"):
+                break
+            current = getattr(current, "master", None)
+        return False
+
+    def _dispatch_scroll_units(self, widget, units: int) -> str:
+        if self._scroll_overflow_widget(widget, units):
+            return "break"
+        scroll_host = self._find_scroll_host(widget)
+        if scroll_host is not None:
+            scroll_host.scroll_units(units)
             return "break"
         return ""
 
-    def _shortcut_scroll_pages(self, pages: int) -> str:
-        active_page = self.pages.get(self.active_page)
-        if active_page and hasattr(active_page, "scroll_pages"):
-            active_page.scroll_pages(pages)
+    def _dispatch_scroll_pages(self, widget, pages: int) -> str:
+        scroll_host = self._find_scroll_host(widget)
+        if scroll_host is not None and hasattr(scroll_host, "scroll_pages"):
+            scroll_host.scroll_pages(pages)
             return "break"
         return ""
+
+    def _shortcut_scroll_units(self, units: int) -> str:
+        return self._dispatch_scroll_units(self._focused_widget(), units)
+
+    def _shortcut_scroll_pages(self, pages: int) -> str:
+        return self._dispatch_scroll_pages(self._focused_widget(), pages)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -3253,6 +4076,11 @@ class VeloraApp(tk.Tk):
         style.configure("TNotebook", background=COLOR_SURFACE, borderwidth=0, tabmargins=(0, 0, 0, 0))
         style.configure("TNotebook.Tab", background=COLOR_SURFACE_SOFT, foreground=COLOR_TEXT_MUTED, padding=(18, 11), borderwidth=0, font=(FONT_BODY_SEMIBOLD, 9))
         style.map("TNotebook.Tab", background=[("selected", COLOR_SURFACE), ("active", COLOR_SURFACE)], foreground=[("selected", COLOR_TEXT), ("active", COLOR_TEXT)])
+
+        style.configure("TopNav.TButton", background=COLOR_NAVY, foreground=COLOR_SIDEBAR_MUTED, padding=(14, 9), borderwidth=0, font=(FONT_BODY_SEMIBOLD, 10))
+        style.map("TopNav.TButton", background=[("active", COLOR_NAVY_DEEP)], foreground=[("active", "#ffffff")])
+        style.configure("TopNavActive.TButton", background=COLOR_SURFACE, foreground=COLOR_NAVY, padding=(14, 9), borderwidth=0, font=(FONT_BODY_SEMIBOLD, 10))
+        style.map("TopNavActive.TButton", background=[("active", COLOR_SURFACE_SOFT)], foreground=[("active", COLOR_NAVY)])
 
         for name, color in [("Accent.TButton", COLOR_TEAL), ("AccentAlt.TButton", COLOR_CORAL)]:
             style.configure(name, background=color, foreground="#ffffff", padding=(18, 12), borderwidth=0, focusthickness=0, font=(FONT_BODY_SEMIBOLD, 10))
@@ -3303,79 +4131,57 @@ class VeloraApp(tk.Tk):
 
     def _build_shell(self, initial_page: str = "dashboard") -> None:
         self.active_page = ""
-        self.sidebar = tk.Frame(self, bg=COLOR_NAVY_DEEP, width=286)
-        self.sidebar.pack(side="left", fill="y")
-        self.sidebar.pack_propagate(False)
+        self.top_bar = tk.Frame(self, bg=COLOR_NAVY, height=74, highlightthickness=1, highlightbackground=COLOR_SIDEBAR_OUTLINE)
+        self.top_bar.pack(side="top", fill="x")
+        self.top_bar.pack_propagate(False)
 
-        brand = tk.Frame(self.sidebar, bg=COLOR_NAVY, bd=0, highlightthickness=1, highlightbackground=COLOR_SIDEBAR_OUTLINE)
-        brand.pack(fill="x", padx=20, pady=(24, 18), ipadx=18, ipady=18)
+        brand = tk.Frame(self.top_bar, bg=COLOR_NAVY)
+        brand.pack(side="left", padx=20, pady=14)
         if self.logo_image is not None:
-            icon = self.logo_image.subsample(5, 5)
-            self.sidebar_logo = icon
-            tk.Label(brand, image=icon, bg=COLOR_NAVY).pack(anchor="w")
-        tk.Label(brand, text=APP_NAME, bg=COLOR_NAVY, fg="#ffffff", font=(FONT_HEADLINE, 20, "bold")).pack(anchor="w", pady=(14, 2))
-        tk.Label(brand, text=APP_TAGLINE, bg=COLOR_NAVY, fg=COLOR_SIDEBAR_MUTED, wraplength=218, justify="left", font=(FONT_BODY, 9)).pack(anchor="w", pady=(0, 6))
-        tk.Label(brand, text="Simple, local, moderne", bg=COLOR_NAVY, fg=COLOR_SIDEBAR_ACCENT, font=(FONT_BODY_SEMIBOLD, 9)).pack(anchor="w")
+            icon = self.logo_image.subsample(8, 8)
+            self.header_logo = icon
+            tk.Label(brand, image=icon, bg=COLOR_NAVY).pack(side="left")
+        brand_copy = tk.Frame(brand, bg=COLOR_NAVY)
+        brand_copy.pack(side="left", padx=(10, 0))
+        tk.Label(brand_copy, text=APP_NAME, bg=COLOR_NAVY, fg="#ffffff", font=(FONT_HEADLINE, 15, "bold")).pack(anchor="w")
+        tk.Label(brand_copy, text=APP_TAGLINE, bg=COLOR_NAVY, fg=COLOR_SIDEBAR_MUTED, font=(FONT_BODY, 9)).pack(anchor="w")
 
-        nav_shell = tk.Frame(self.sidebar, bg=COLOR_NAVY_DEEP)
-        nav_shell.pack(fill="both", expand=True, padx=14)
-        self.sidebar_scroll = SidebarScrollArea(nav_shell, width=246)
-        self.sidebar_scroll.pack(fill="both", expand=True)
-        nav_zone = self.sidebar_scroll.content
-
-        self.nav_buttons: dict[str, SidebarNavButton] = {}
-        self.nav_groups: dict[str, dict] = {}
-        self.page_to_group: dict[str, str] = {}
-        sections = [
-            ("pilotage", "Pilotage", [("dashboard", "Tableau de bord"), ("calendar", "Calendrier")]),
-            ("documents", "Documents", [("invoices", "Factures"), ("quotes", "Devis")]),
-            ("flux", "Flux", [("sales", "Recettes"), ("expenses", "Depenses"), ("payroll", "Paie")]),
-            ("organisation", "Organisation", [("todos", "Todo liste"), ("company", "Parametres")]),
+        nav_shell = tk.Frame(self.top_bar, bg=COLOR_NAVY)
+        nav_shell.pack(side="left", fill="x", expand=True, padx=14)
+        self.nav_buttons: dict[str, ttk.Button] = {}
+        nav_items = [
+            ("dashboard", "Vue d'ensemble"),
+            ("calendar", "Calendrier"),
+            ("invoices", "Factures"),
+            ("quotes", "Devis"),
+            ("sales", "Recettes"),
+            ("expenses", "Depenses"),
+            ("payroll", "Paie"),
+            ("todos", "Taches"),
+            ("company", "Parametres"),
         ]
+        for key, label in nav_items:
+            button = ttk.Button(nav_shell, text=label, style="TopNav.TButton", command=lambda page=key: self.show_page(page))
+            button.pack(side="left", padx=4, pady=16)
+            self.nav_buttons[key] = button
 
-        for group_key, section_title, items in sections:
-            group_frame = tk.Frame(nav_zone, bg=COLOR_NAVY_DEEP)
-            group_frame.pack(fill="x", pady=(0, 8))
-            header_button = SidebarNavButton(
-                group_frame,
-                text=section_title,
-                command=lambda current_group=group_key: self._toggle_nav_group(current_group),
-                kind="group",
-            )
-            header_button.pack(fill="x")
-            body_frame = tk.Frame(group_frame, bg=COLOR_NAVY_DEEP)
-            self.nav_groups[group_key] = {
-                "button": header_button,
-                "body": body_frame,
-                "label": section_title,
-                "expanded": False,
-            }
-
-            for key, label in items:
-                button = SidebarNavButton(
-                    body_frame,
-                    text=label,
-                    command=lambda page=key: self.show_page(page),
-                    kind="item",
-                )
-                button.pack(fill="x", padx=0, pady=4)
-                self.nav_buttons[key] = button
-                self.page_to_group[key] = group_key
-
-        footer = tk.Frame(self.sidebar, bg=COLOR_NAVY, bd=0, highlightthickness=1, highlightbackground=COLOR_SIDEBAR_OUTLINE)
-        footer.pack(side="bottom", fill="x", padx=20, pady=20, ipadx=18, ipady=16)
-        tk.Label(footer, text="Local", bg=COLOR_NAVY, fg="#ffffff", font=(FONT_BODY_SEMIBOLD, 10)).pack(anchor="w")
-        tk.Label(footer, text="100% sur cette machine", bg=COLOR_NAVY, fg=COLOR_SIDEBAR_ACCENT, font=(FONT_BODY_SEMIBOLD, 9)).pack(anchor="w", pady=(4, 8))
-        tk.Label(footer, text=str(storage_root()), bg=COLOR_NAVY, fg=COLOR_SIDEBAR_MUTED, wraplength=220, justify="left", font=(FONT_BODY, 8)).pack(anchor="w")
+        status = tk.Frame(self.top_bar, bg=COLOR_NAVY)
+        status.pack(side="right", padx=20)
+        self.documents_status_var = tk.StringVar(value=str(documents_root()))
+        tk.Label(status, text="Documents", bg=COLOR_NAVY, fg="#ffffff", font=(FONT_BODY_SEMIBOLD, 9)).pack(anchor="e", pady=(16, 0))
+        tk.Label(status, textvariable=self.documents_status_var, bg=COLOR_NAVY, fg=COLOR_SIDEBAR_MUTED, font=(FONT_BODY, 8), wraplength=260, justify="right").pack(anchor="e")
 
         self.main_area = ttk.Frame(self, style="App.TFrame")
-        self.main_area.pack(side="left", fill="both", expand=True)
+        self.main_area.pack(side="top", fill="both", expand=True)
+
+        self.toast_host = tk.Frame(self, bg=COLOR_BG)
+        self.toast_host.place(relx=1.0, y=92, x=-18, anchor="ne")
 
         self.pages = {
             "dashboard": DashboardPage(self.main_area, self),
             "calendar": CalendarPage(self.main_area, self),
-            "invoices": DocumentPage(self.main_area, self, "Factures", "Creation, suivi et ouverture locale de vos factures clients.", "invoice"),
-            "quotes": DocumentPage(self.main_area, self, "Devis", "Generateur de devis avec validite modifiable et suivi d'acceptation.", "quote"),
+            "invoices": DocumentPage(self.main_area, self, "Factures", "Creation, suivi, modification et ouverture locale des factures.", "invoice"),
+            "quotes": DocumentPage(self.main_area, self, "Devis", "Creation, suivi, modification et conversion en facture.", "quote"),
             "sales": SalesPage(self.main_area, self),
             "expenses": ExpensesPage(self.main_area, self),
             "payroll": EmployeeExpensesPage(self.main_area, self),
@@ -3388,20 +4194,19 @@ class VeloraApp(tk.Tk):
 
     def show_page(self, name: str) -> None:
         self.active_page = name
-        active_group = self.page_to_group.get(name)
-        if active_group:
-            self._expand_only_group(active_group)
         for key, page in self.pages.items():
             if key == name:
                 page.lift()
-            self._set_nav_button_state(key, "default")
+            self._set_nav_button_state(key, "active" if key == name else "default")
+        if hasattr(self, "documents_status_var"):
+            self.documents_status_var.set(str(documents_root()))
         active_page = self.pages.get(name)
         if active_page and hasattr(active_page, "animate_in"):
             active_page.animate_in()
 
     def _set_nav_button_state(self, key: str, mode: str) -> None:
         button = self.nav_buttons[key]
-        button.set_state(active=(key == self.active_page), expanded=False)
+        button.configure(style="TopNavActive.TButton" if key == self.active_page else "TopNav.TButton")
 
     def _toggle_nav_group(self, group_key: str) -> None:
         group = self.nav_groups[group_key]
@@ -3437,10 +4242,12 @@ class VeloraApp(tk.Tk):
         self.current_theme = apply_runtime_palette(theme_name)
         current_page = keep_page or self.active_page or "dashboard"
         self.configure(bg=COLOR_BG)
-        if hasattr(self, "sidebar"):
-            self.sidebar.destroy()
+        if hasattr(self, "top_bar"):
+            self.top_bar.destroy()
         if hasattr(self, "main_area"):
             self.main_area.destroy()
+        if hasattr(self, "toast_host"):
+            self.toast_host.destroy()
         self._configure_styles()
         self._build_shell(current_page)
         self.refresh_all_pages()
@@ -3453,3 +4260,6 @@ class VeloraApp(tk.Tk):
     def on_close(self) -> None:
         self.db.close()
         self.destroy()
+
+
+VeloraApp = NoryvenApp
