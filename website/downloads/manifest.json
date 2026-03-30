@@ -1,28 +1,24 @@
 {
-<<<<<<< HEAD
-  "generated_at": "2026-03-30T17:52:12.409978+00:00",
-=======
-  "generated_at": "2026-03-30T16:55:00+00:00",
->>>>>>> b813455 (ui: improve buttons, logo and interface polish)
+  "generated_at": "2026-03-30T22:13:52.180050+00:00",
   "windows": {
-    "available": false,
+    "available": true,
     "filename": "noryven-windows.exe",
-    "url": "",
-    "sha256": "",
-    "size_bytes": 0
+    "url": "https://github.com/lamelow78/VELORA/releases/download/downloads-latest/noryven-windows.exe",
+    "sha256": "37b782a37d2575b227863b8b9e1d2eb7e0eef90caac63c71ddf428ad9c9c7e37",
+    "size_bytes": 12794823
   },
   "macos": {
-    "available": false,
+    "available": true,
     "filename": "noryven-macos.zip",
-    "url": "",
-    "sha256": "",
-    "size_bytes": 0
+    "url": "https://github.com/lamelow78/VELORA/releases/download/downloads-latest/noryven-macos.zip",
+    "sha256": "c22dc6a4e1de554ab8f0d1af32800c2658586248020dab1d3449fd1c21992584",
+    "size_bytes": 21293508
   },
   "linux": {
-    "available": false,
+    "available": true,
     "filename": "noryven-linux.tar.gz",
-    "url": "",
-    "sha256": "",
-    "size_bytes": 0
+    "url": "https://github.com/lamelow78/VELORA/releases/download/downloads-latest/noryven-linux.tar.gz",
+    "sha256": "334063b9fe21f721104969c6d2fa0f26ef84f76a0bd01f9f52e7051d6e9687df",
+    "size_bytes": 27478395
   }
 }
