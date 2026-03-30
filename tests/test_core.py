@@ -5,8 +5,9 @@ import sqlite3
 import unittest
 from pathlib import Path
 
+from velora_finance.config import storage_root
 from velora_finance.database import Database
-from velora_finance.documents import document_target_path, save_document_html
+from velora_finance.documents import build_document_html, document_target_path, save_document_html
 from velora_finance.exports import export_month_bundle
 
 
@@ -26,6 +27,7 @@ class VeloraCoreTests(unittest.TestCase):
         self.db_path.unlink(missing_ok=True)
         if self.export_root.exists():
             shutil.rmtree(self.export_root)
+        (storage_root() / "documents" / "depenses" / "test-depense-piece.pdf").unlink(missing_ok=True)
 
     def _invoice_payload(self, number: str, client_name: str = "Client") -> dict:
         return {
@@ -51,6 +53,12 @@ class VeloraCoreTests(unittest.TestCase):
         self.assertEqual(target.name, "evil-facture-test.html")
         self.assertIn("documents", str(target))
         self.assertIn("factures", str(target))
+
+    def test_generated_document_uses_simple_header_without_color_banner(self) -> None:
+        payload = self._invoice_payload("FACT-HEADER-001", "Client Test")
+        rendered = build_document_html("invoice", payload)
+        self.assertIn('class="header"', rendered)
+        self.assertNotIn('class="banner"', rendered)
 
     def test_duplicate_invoice_does_not_overwrite_existing_html(self) -> None:
         payload = self._invoice_payload("FACT-TEST-001", "Premier")
@@ -128,9 +136,33 @@ class VeloraCoreTests(unittest.TestCase):
         self.db.delete_quote(quote_id)
         self.assertFalse(html_path.exists())
 
+    def test_delete_expense_removes_local_attachment(self) -> None:
+        attachment = storage_root() / "documents" / "depenses" / "test-depense-piece.pdf"
+        attachment.write_text("piece", encoding="utf-8")
+        self.db.add_expense(
+            {
+                "expense_date": "2026-03-12",
+                "company_name": "Fournisseur",
+                "category": "Achats",
+                "amount_ht": 40.0,
+                "amount_ttc": 48.0,
+                "source_type": "manual",
+                "source_invoice_id": None,
+                "attachment_path": str(attachment),
+                "notes": "",
+            }
+        )
+
+        expense_id = int(self.db.list_expenses()[0]["id"])
+        self.assertTrue(attachment.exists())
+        self.db.delete_expense(expense_id)
+        self.assertFalse(attachment.exists())
+
     def test_dashboard_avoids_double_counting_invoice_linked_sale(self) -> None:
         first_invoice = self._invoice_payload("FACT-DASH-001", "Acme")
         second_invoice = self._invoice_payload("FACT-DASH-002", "Beta")
+        first_invoice["status"] = "Envoyee"
+        second_invoice["status"] = "Payee"
         first_id = self.db.create_invoice({**first_invoice, "html_path": document_target_path("invoice", first_invoice["number"])})
         self.db.create_invoice({**second_invoice, "html_path": document_target_path("invoice", second_invoice["number"])})
 
@@ -160,6 +192,7 @@ class VeloraCoreTests(unittest.TestCase):
         )
         snapshot = self.db.dashboard_snapshot()
         self.assertEqual(snapshot["revenue_total"], 300.0)
+        self.assertEqual(snapshot["draft_revenue_total"], 0.0)
 
     def test_document_preferences_are_persisted(self) -> None:
         self.db.save_document_preferences(
@@ -174,6 +207,7 @@ class VeloraCoreTests(unittest.TestCase):
                 "default_quote_notes": "Note devis",
                 "default_invoice_status": "Envoyee",
                 "default_quote_status": "Envoye",
+                "ui_theme": "Sombre",
             }
         )
         preferences = self.db.get_document_preferences()
@@ -182,6 +216,7 @@ class VeloraCoreTests(unittest.TestCase):
         self.assertEqual(preferences["quote_validity_days"], 15)
         self.assertEqual(preferences["default_client_name"], "Client modele")
         self.assertEqual(preferences["default_quote_status"], "Envoye")
+        self.assertEqual(preferences["ui_theme"], "Sombre")
 
     def test_create_invoice_rejects_due_date_before_issue_date(self) -> None:
         payload = self._invoice_payload("FACT-BAD-DATE-001", "Acme")
@@ -197,6 +232,30 @@ class VeloraCoreTests(unittest.TestCase):
         payload.pop("due_date")
         with self.assertRaises(ValueError):
             self.db.create_quote({**payload, "html_path": document_target_path("quote", payload["number"])})
+
+    def test_save_company_profile_rejects_invalid_siret(self) -> None:
+        with self.assertRaises(ValueError):
+            self.db.save_company_profile(
+                {
+                    "company_name": "Velora",
+                    "legal_name": "Velora SAS",
+                    "siret": "1234",
+                    "vat_number": "FR12345678901",
+                    "email": "contact@velora.fr",
+                    "phone": "0102030405",
+                    "address": "1 rue test",
+                    "footer": "Merci",
+                    "logo_path": "",
+                }
+            )
+
+    def test_save_document_preferences_rejects_invalid_default_client_email(self) -> None:
+        with self.assertRaises(ValueError):
+            self.db.save_document_preferences(
+                {
+                    "default_client_email": "email-invalide",
+                }
+            )
 
     def test_add_sale_rejects_invalid_data_at_database_level(self) -> None:
         with self.assertRaises(ValueError):
@@ -224,6 +283,44 @@ class VeloraCoreTests(unittest.TestCase):
                     "details": "",
                 }
             )
+
+    def test_add_employee_expense_persists_employee_fields(self) -> None:
+        self.db.add_expense(
+            {
+                "expense_date": "2026-03-18",
+                "company_name": "Alice Martin",
+                "category": "Salaires",
+                "expense_kind": "employee",
+                "expense_label": "Prime",
+                "employee_name": "Alice Martin",
+                "payroll_month": "2026-03",
+                "amount_ht": 1000.0,
+                "amount_ttc": 1000.0,
+                "source_type": "manual",
+                "source_invoice_id": None,
+                "notes": "Prime trimestrielle",
+            }
+        )
+
+        row = dict(self.db.list_expenses("employee")[0])
+        self.assertEqual(row["expense_kind"], "employee")
+        self.assertEqual(row["employee_name"], "Alice Martin")
+        self.assertEqual(row["expense_label"], "Prime")
+        self.assertEqual(row["payroll_month"], "2026-03")
+
+    def test_dashboard_snapshot_excludes_draft_invoices_from_health_revenue(self) -> None:
+        draft_invoice = self._invoice_payload("FACT-DRAFT-001", "Draft Client")
+        confirmed_invoice = self._invoice_payload("FACT-CONF-001", "Confirmed Client")
+        confirmed_invoice["status"] = "Envoyee"
+        self.db.create_invoice({**draft_invoice, "html_path": document_target_path("invoice", draft_invoice["number"])})
+        self.db.create_invoice({**confirmed_invoice, "html_path": document_target_path("invoice", confirmed_invoice["number"])})
+
+        snapshot = self.db.dashboard_snapshot()
+
+        self.assertEqual(snapshot["revenue_total"], 120.0)
+        self.assertEqual(snapshot["draft_revenue_total"], 120.0)
+        self.assertEqual(snapshot["invoice_revenue_total"], 120.0)
+        self.assertEqual(len(snapshot["activity_points"]), 1)
 
     def test_sqlite_schema_rejects_invalid_invoice_dates(self) -> None:
         with self.assertRaises(sqlite3.IntegrityError):
@@ -326,6 +423,74 @@ class VeloraCoreTests(unittest.TestCase):
         content = csv_file.read_text(encoding="utf-8")
         self.assertIn("Fournisseur Export", content)
         self.assertIn("Licence mensuelle", content)
+
+    def test_export_employee_expense_month_bundle_reports_missing_attachment(self) -> None:
+        attachment = self.export_root / "missing" / "fiche-paie.pdf"
+        self.db.add_expense(
+            {
+                "expense_date": "2026-03-18",
+                "company_name": "Alice Martin",
+                "category": "Salaires",
+                "expense_kind": "employee",
+                "expense_label": "Salaire",
+                "employee_name": "Alice Martin",
+                "payroll_month": "2026-03",
+                "amount_ht": 1500.0,
+                "amount_ttc": 1500.0,
+                "source_type": "manual",
+                "source_invoice_id": None,
+                "attachment_path": str(attachment),
+                "notes": "",
+            }
+        )
+
+        export_result = export_month_bundle(
+            "employee_expense",
+            [dict(row) for row in self.db.list_expenses("employee")],
+            "2026-03",
+            self.export_root,
+        )
+
+        self.assertEqual(len(export_result.missing_documents), 1)
+        self.assertIn("Alice Martin", export_result.missing_documents[0])
+        missing_csv = export_result.export_root / "documents-manquants-2026-03.csv"
+        self.assertTrue(missing_csv.exists())
+
+    def test_reset_all_data_clears_database_and_local_documents(self) -> None:
+        invoice_payload = self._invoice_payload("FACT-RESET-001", "Client Reset")
+        invoice_payload["status"] = "Envoyee"
+        invoice_html = document_target_path("invoice", invoice_payload["number"])
+        self.db.create_invoice({**invoice_payload, "html_path": invoice_html})
+        save_document_html("invoice", invoice_payload, invoice_html)
+
+        expense_attachment = storage_root() / "documents" / "depenses" / "test-reset-piece.pdf"
+        expense_attachment.write_text("piece", encoding="utf-8")
+        self.db.add_expense(
+            {
+                "expense_date": "2026-03-20",
+                "company_name": "Fournisseur Reset",
+                "category": "Logiciels",
+                "amount_ht": 10.0,
+                "amount_ttc": 12.0,
+                "source_type": "manual",
+                "source_invoice_id": None,
+                "attachment_path": str(expense_attachment),
+                "notes": "",
+            }
+        )
+
+        self.assertTrue(invoice_html.exists())
+        self.assertTrue(expense_attachment.exists())
+
+        self.db.reset_all_data()
+
+        self.assertEqual(self.db.list_invoices(), [])
+        self.assertEqual(self.db.list_expenses(), [])
+        self.assertEqual(self.db.list_sales(), [])
+        self.assertEqual(self.db.list_quotes(), [])
+        self.assertEqual(self.db.list_todos(), [])
+        self.assertFalse(invoice_html.exists())
+        self.assertFalse(expense_attachment.exists())
 
     def test_export_invoice_month_bundle_reports_missing_html(self) -> None:
         payload = self._invoice_payload("FACT-EXPORT-MISSING-001", "Client Export")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar as month_calendar
 import json
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import date, datetime
@@ -33,7 +34,10 @@ DEFAULT_DOCUMENT_PREFERENCES = {
     "default_quote_notes": "",
     "default_invoice_status": "Brouillon",
     "default_quote_status": "Brouillon",
+    "ui_theme": "Clair",
 }
+
+RECOGNIZED_INVOICE_STATUSES = ("Envoyee", "Payee", "En retard")
 
 
 class Database:
@@ -84,11 +88,16 @@ class Database:
                 vendor TEXT NOT NULL CHECK(TRIM(vendor) <> ''),
                 company_name TEXT NOT NULL DEFAULT '' CHECK(TRIM(company_name) <> ''),
                 category TEXT NOT NULL CHECK(TRIM(category) <> ''),
+                expense_kind TEXT NOT NULL DEFAULT 'general' CHECK(expense_kind IN ('general', 'employee')),
+                expense_label TEXT NOT NULL DEFAULT '',
+                employee_name TEXT NOT NULL DEFAULT '',
+                payroll_month TEXT NOT NULL DEFAULT '' CHECK(length(payroll_month) IN (0, 7)),
                 amount REAL NOT NULL DEFAULT 0 CHECK(amount >= 0),
                 amount_ht REAL NOT NULL DEFAULT 0 CHECK(amount_ht >= 0),
                 amount_ttc REAL NOT NULL DEFAULT 0 CHECK(amount_ttc >= amount_ht),
                 source_type TEXT NOT NULL DEFAULT 'manual' CHECK(source_type IN ('manual', 'invoice')),
                 source_invoice_id INTEGER,
+                attachment_path TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -181,8 +190,13 @@ class Database:
         self._ensure_column("expenses", "company_name", "TEXT DEFAULT ''")
         self._ensure_column("expenses", "amount_ht", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("expenses", "amount_ttc", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("expenses", "expense_kind", "TEXT NOT NULL DEFAULT 'general'")
+        self._ensure_column("expenses", "expense_label", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("expenses", "employee_name", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("expenses", "payroll_month", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("expenses", "source_type", "TEXT NOT NULL DEFAULT 'manual'")
         self._ensure_column("expenses", "source_invoice_id", "INTEGER")
+        self._ensure_column("expenses", "attachment_path", "TEXT DEFAULT ''")
         self._ensure_column("expenses", "created_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("expenses", "updated_at", "TEXT NOT NULL DEFAULT ''")
 
@@ -285,7 +299,7 @@ class Database:
         current_version = int(
             self.connection.execute("PRAGMA user_version").fetchone()[0]
         )
-        target_version = 2
+        target_version = 4
         if current_version >= target_version:
             return
         self._rebuild_tables_with_constraints()
@@ -627,11 +641,16 @@ class Database:
                 vendor TEXT NOT NULL CHECK(TRIM(vendor) <> ''),
                 company_name TEXT NOT NULL DEFAULT '' CHECK(TRIM(company_name) <> ''),
                 category TEXT NOT NULL CHECK(TRIM(category) <> ''),
+                expense_kind TEXT NOT NULL DEFAULT 'general' CHECK(expense_kind IN ('general', 'employee')),
+                expense_label TEXT NOT NULL DEFAULT '',
+                employee_name TEXT NOT NULL DEFAULT '',
+                payroll_month TEXT NOT NULL DEFAULT '' CHECK(length(payroll_month) IN (0, 7)),
                 amount REAL NOT NULL DEFAULT 0 CHECK(amount >= 0),
                 amount_ht REAL NOT NULL DEFAULT 0 CHECK(amount_ht >= 0),
                 amount_ttc REAL NOT NULL DEFAULT 0 CHECK(amount_ttc >= amount_ht),
                 source_type TEXT NOT NULL DEFAULT 'manual' CHECK(source_type IN ('manual', 'invoice')),
                 source_invoice_id INTEGER,
+                attachment_path TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -643,8 +662,8 @@ class Database:
             );
 
             INSERT INTO expenses__new (
-                id, expense_date, vendor, company_name, category, amount, amount_ht, amount_ttc,
-                source_type, source_invoice_id, notes, created_at, updated_at
+                id, expense_date, vendor, company_name, category, expense_kind, expense_label, employee_name, payroll_month,
+                amount, amount_ht, amount_ttc, source_type, source_invoice_id, attachment_path, notes, created_at, updated_at
             )
             SELECT
                 id,
@@ -660,6 +679,19 @@ class Database:
                 CASE
                     WHEN TRIM(COALESCE(category, '')) = '' THEN 'Autre'
                     ELSE category
+                END,
+                CASE
+                    WHEN TRIM(COALESCE(expense_kind, '')) = 'employee' THEN 'employee'
+                    ELSE 'general'
+                END,
+                CASE
+                    WHEN TRIM(COALESCE(expense_label, '')) = '' AND TRIM(COALESCE(expense_kind, '')) = 'employee' THEN 'Salaire'
+                    ELSE COALESCE(expense_label, '')
+                END,
+                COALESCE(employee_name, ''),
+                CASE
+                    WHEN length(COALESCE(payroll_month, '')) = 7 THEN payroll_month
+                    ELSE ''
                 END,
                 CASE
                     WHEN COALESCE(NULLIF(amount_ttc, 0), amount) < 0 THEN 0
@@ -687,6 +719,7 @@ class Database:
                     THEN source_invoice_id
                     ELSE NULL
                 END,
+                COALESCE(attachment_path, ''),
                 COALESCE(notes, ''),
                 CASE
                     WHEN TRIM(COALESCE(created_at, '')) = '' THEN expense_date || 'T00:00:00'
@@ -711,6 +744,30 @@ class Database:
 
     def close(self) -> None:
         self.connection.close()
+
+    def reset_all_data(self) -> None:
+        documents_root = self.root / "documents"
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            for table in ("sales", "expenses", "invoices", "quotes", "todos"):
+                self.connection.execute(f"DELETE FROM {table}")
+            self.connection.execute("DELETE FROM settings")
+            self.connection.commit()
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
+        if documents_root.exists():
+            for path in sorted(documents_root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                try:
+                    if path.is_file():
+                        path.unlink(missing_ok=True)
+                    elif path.is_dir():
+                        path.rmdir()
+                except OSError:
+                    continue
+        (documents_root / "factures").mkdir(parents=True, exist_ok=True)
+        (documents_root / "devis").mkdir(parents=True, exist_ok=True)
+        (documents_root / "depenses").mkdir(parents=True, exist_ok=True)
+        self._ensure_defaults()
 
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
@@ -743,16 +800,20 @@ class Database:
     def save_company_profile(self, profile: dict) -> None:
         clean_profile = DEFAULT_COMPANY_PROFILE.copy()
         clean_profile.update(profile)
+        clean_profile = self._validate_company_profile(clean_profile)
         self.set_setting("company_profile", clean_profile)
 
     def get_document_preferences(self) -> dict:
         preferences = DEFAULT_DOCUMENT_PREFERENCES.copy()
         preferences.update(self.get_setting("document_preferences") or {})
+        if preferences.get("ui_theme") not in {"Clair", "Sombre"}:
+            preferences["ui_theme"] = "Clair"
         return preferences
 
     def save_document_preferences(self, preferences: dict) -> None:
         clean_preferences = DEFAULT_DOCUMENT_PREFERENCES.copy()
         clean_preferences.update(preferences)
+        clean_preferences = self._validate_document_preferences(clean_preferences)
         self.set_setting("document_preferences", clean_preferences)
 
     def _parse_iso_date(self, value: str, label: str) -> date:
@@ -779,6 +840,98 @@ class Database:
     def _validate_tax_rate(self, tax_rate: float) -> None:
         if tax_rate < 0 or tax_rate > 100:
             raise ValueError("Le taux de TVA doit etre compris entre 0 et 100.")
+
+    def _validate_email(self, value: str, label: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return ""
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", cleaned):
+            raise ValueError(f"{label} invalide.")
+        return cleaned
+
+    def _validate_phone(self, value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return ""
+        digits = re.sub(r"\D", "", cleaned)
+        if len(digits) < 6:
+            raise ValueError("Le telephone doit contenir au moins 6 chiffres.")
+        if not re.fullmatch(r"[0-9+\s().-]+", cleaned):
+            raise ValueError("Le telephone contient des caracteres invalides.")
+        return cleaned
+
+    def _validate_siret(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", "", str(value or "").strip())
+        if not cleaned:
+            return ""
+        if not re.fullmatch(r"\d{14}", cleaned):
+            raise ValueError("Le SIRET doit contenir 14 chiffres.")
+        return cleaned
+
+    def _validate_vat_number(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", "", str(value or "").upper())
+        if not cleaned:
+            return ""
+        if not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{2,13}", cleaned):
+            raise ValueError("Le numero de TVA est invalide.")
+        return cleaned
+
+    def _validate_company_profile(self, profile: dict) -> dict:
+        clean_profile = DEFAULT_COMPANY_PROFILE.copy()
+        clean_profile.update(profile or {})
+        clean_profile["company_name"] = str(clean_profile.get("company_name", "")).strip() or DEFAULT_COMPANY_PROFILE["company_name"]
+        clean_profile["legal_name"] = str(clean_profile.get("legal_name", "")).strip() or clean_profile["company_name"]
+        clean_profile["siret"] = self._validate_siret(clean_profile.get("siret", ""))
+        clean_profile["vat_number"] = self._validate_vat_number(clean_profile.get("vat_number", ""))
+        clean_profile["email"] = self._validate_email(clean_profile.get("email", ""), "L'email entreprise")
+        clean_profile["phone"] = self._validate_phone(clean_profile.get("phone", ""))
+        clean_profile["address"] = str(clean_profile.get("address", "")).strip()
+        clean_profile["footer"] = str(clean_profile.get("footer", "")).strip() or DEFAULT_COMPANY_PROFILE["footer"]
+        clean_profile["logo_path"] = str(clean_profile.get("logo_path", "")).strip()
+        return clean_profile
+
+    def _validate_document_preferences(self, preferences: dict) -> dict:
+        clean_preferences = DEFAULT_DOCUMENT_PREFERENCES.copy()
+        clean_preferences.update(preferences or {})
+        clean_preferences["default_tax_rate"] = float(clean_preferences.get("default_tax_rate", 20.0))
+        self._validate_tax_rate(clean_preferences["default_tax_rate"])
+        clean_preferences["invoice_due_days"] = int(clean_preferences.get("invoice_due_days", 30))
+        clean_preferences["quote_validity_days"] = int(clean_preferences.get("quote_validity_days", 30))
+        if clean_preferences["invoice_due_days"] < 0 or clean_preferences["quote_validity_days"] < 0:
+            raise ValueError("Les delais de document doivent etre positifs.")
+        clean_preferences["default_client_name"] = str(clean_preferences.get("default_client_name", "")).strip()
+        clean_preferences["default_client_email"] = self._validate_email(
+            clean_preferences.get("default_client_email", ""),
+            "L'email client par defaut",
+        )
+        clean_preferences["default_client_address"] = str(clean_preferences.get("default_client_address", "")).strip()
+        clean_preferences["default_invoice_notes"] = str(clean_preferences.get("default_invoice_notes", "")).strip()
+        clean_preferences["default_quote_notes"] = str(clean_preferences.get("default_quote_notes", "")).strip()
+        clean_preferences["default_invoice_status"] = self._validate_document_status(
+            "invoice",
+            clean_preferences.get("default_invoice_status", "Brouillon"),
+        )
+        clean_preferences["default_quote_status"] = self._validate_document_status(
+            "quote",
+            clean_preferences.get("default_quote_status", "Brouillon"),
+        )
+        clean_preferences["ui_theme"] = (
+            str(clean_preferences.get("ui_theme", "Clair")).strip().capitalize()
+            if str(clean_preferences.get("ui_theme", "Clair")).strip().capitalize() in {"Clair", "Sombre"}
+            else "Clair"
+        )
+        return clean_preferences
+
+    def _normalize_payroll_month(self, value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return ""
+        if not re.fullmatch(r"\d{4}-\d{2}", cleaned):
+            raise ValueError("Le mois de paie doit etre au format AAAA-MM.")
+        year, month = cleaned.split("-")
+        if int(month) < 1 or int(month) > 12:
+            raise ValueError("Le mois de paie est invalide.")
+        return f"{int(year):04d}-{int(month):02d}"
 
     def _validate_document_status(self, kind: str, status: str) -> str:
         allowed = {
@@ -819,6 +972,29 @@ class Database:
         amount_ttc = float(payload["amount_ttc"])
         self._validate_money_pair(amount_ht, amount_ttc)
         source_type, source_invoice_id = self._validate_financial_source(payload)
+        expense_kind = "general"
+        expense_label = ""
+        employee_name = ""
+        payroll_month = ""
+        if date_field == "expense_date":
+            expense_kind = str(payload.get("expense_kind", "general")).strip() or "general"
+            if expense_kind not in {"general", "employee"}:
+                raise ValueError("Le type de depense est invalide.")
+            expense_label = str(payload.get("expense_label", "")).strip()
+            employee_name = str(payload.get("employee_name", "")).strip()
+            payroll_month = self._normalize_payroll_month(payload.get("payroll_month", ""))
+            if expense_kind == "employee":
+                if not employee_name:
+                    raise ValueError("Le nom de l'employe est obligatoire.")
+                company_name = employee_name
+                if not expense_label:
+                    expense_label = "Salaire"
+                if not payroll_month:
+                    raise ValueError("Le mois de paie est obligatoire.")
+            else:
+                expense_label = expense_label or category
+                employee_name = ""
+                payroll_month = ""
         return {
             "date_value": date_value,
             "company_name": company_name,
@@ -827,6 +1003,11 @@ class Database:
             "amount_ttc": amount_ttc,
             "source_type": source_type,
             "source_invoice_id": source_invoice_id,
+            "expense_kind": expense_kind,
+            "expense_label": expense_label,
+            "employee_name": employee_name,
+            "payroll_month": payroll_month,
+            "attachment_path": str(payload.get("attachment_path", "")).strip(),
             "notes": str(payload.get("notes", "")).strip(),
         }
 
@@ -897,6 +1078,7 @@ class Database:
         company_profile = payload.get("company_profile")
         if not isinstance(company_profile, dict):
             raise ValueError("Le profil entreprise du document est invalide.")
+        company_profile = self._validate_company_profile(company_profile)
 
         validated = {
             "number": number,
@@ -936,11 +1118,11 @@ class Database:
             "details": str(payload.get("details", "")).strip(),
         }
 
-    def _delete_local_document_file(self, html_path: str | None) -> None:
-        if not html_path:
+    def _delete_local_storage_file(self, file_path: str | None) -> None:
+        if not file_path:
             return
         try:
-            target = Path(html_path).resolve()
+            target = Path(file_path).resolve()
         except Exception:
             return
         documents_root = (self.root / "documents").resolve()
@@ -950,6 +1132,9 @@ class Database:
             target.unlink(missing_ok=True)
         except OSError:
             return
+
+    def _delete_local_document_file(self, html_path: str | None) -> None:
+        self._delete_local_storage_file(html_path)
 
     def add_sale(self, payload: dict) -> None:
         validated = self._validate_financial_payload(payload, "sale_date")
@@ -1011,21 +1196,26 @@ class Database:
         self.connection.execute(
             """
             INSERT INTO expenses (
-                expense_date, vendor, company_name, category, amount, amount_ht, amount_ttc,
-                source_type, source_invoice_id, notes, created_at, updated_at
+                expense_date, vendor, company_name, category, expense_kind, expense_label, employee_name, payroll_month,
+                amount, amount_ht, amount_ttc, source_type, source_invoice_id, attachment_path, notes, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 validated["date_value"],
                 validated["company_name"],
                 validated["company_name"],
                 validated["category"],
+                validated["expense_kind"],
+                validated["expense_label"],
+                validated["employee_name"],
+                validated["payroll_month"],
                 validated["amount_ttc"],
                 validated["amount_ht"],
                 validated["amount_ttc"],
                 validated["source_type"],
                 validated["source_invoice_id"],
+                validated["attachment_path"],
                 validated["notes"],
                 now,
                 now,
@@ -1033,31 +1223,44 @@ class Database:
         )
         self.connection.commit()
 
-    def list_expenses(self) -> list[sqlite3.Row]:
-        return self.connection.execute(
-            """
+    def list_expenses(self, expense_kind: str | None = None) -> list[sqlite3.Row]:
+        query = """
             SELECT
                 id,
                 expense_date,
                 vendor,
                 company_name,
                 category,
+                expense_kind,
+                expense_label,
+                employee_name,
+                payroll_month,
                 amount,
                 amount_ht,
                 amount_ttc,
                 source_type,
                 source_invoice_id,
+                attachment_path,
                 notes,
                 created_at,
                 updated_at
             FROM expenses
-            ORDER BY expense_date DESC, id DESC
-            """
-        ).fetchall()
+        """
+        params: tuple = ()
+        if expense_kind in {"general", "employee"}:
+            query += " WHERE expense_kind = ?"
+            params = (expense_kind,)
+        query += " ORDER BY expense_date DESC, id DESC"
+        return self.connection.execute(query, params).fetchall()
 
     def delete_expense(self, expense_id: int) -> None:
+        row = self.connection.execute(
+            "SELECT attachment_path FROM expenses WHERE id = ?",
+            (expense_id,),
+        ).fetchone()
         self.connection.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
         self.connection.commit()
+        self._delete_local_storage_file(row["attachment_path"] if row else None)
 
     def create_invoice(self, payload: dict) -> int:
         validated = self._validate_document_payload("invoice", payload)
@@ -1293,7 +1496,12 @@ class Database:
         return f"{prefix}-{period}-{sequence + 1:03d}"
 
     def dashboard_snapshot(self) -> dict:
-        invoice_total = self._scalar("SELECT COALESCE(SUM(total), 0) FROM invoices")
+        invoice_total = self._scalar(
+            "SELECT COALESCE(SUM(total), 0) FROM invoices WHERE status IN ('Envoyee', 'Payee', 'En retard')"
+        )
+        draft_invoice_total = self._scalar(
+            "SELECT COALESCE(SUM(total), 0) FROM invoices WHERE status = 'Brouillon'"
+        )
         manual_sales_total = self._scalar(
             """
             SELECT COALESCE(SUM(CASE
@@ -1306,12 +1514,16 @@ class Database:
         expenses_total = self._scalar(
             "SELECT COALESCE(SUM(COALESCE(NULLIF(amount_ttc, 0), amount)), 0) FROM expenses"
         )
+        employee_expenses_total = self._scalar(
+            "SELECT COALESCE(SUM(COALESCE(NULLIF(amount_ttc, 0), amount)), 0) FROM expenses WHERE expense_kind = 'employee'"
+        )
         revenue_total = float(invoice_total) + float(manual_sales_total)
         profit_total = revenue_total - float(expenses_total)
 
         open_invoices = self._scalar(
-            "SELECT COUNT(*) FROM invoices WHERE status IN ('Brouillon', 'Envoyee', 'En retard')"
+            "SELECT COUNT(*) FROM invoices WHERE status IN ('Envoyee', 'En retard')"
         )
+        draft_invoices = self._scalar("SELECT COUNT(*) FROM invoices WHERE status = 'Brouillon'")
         pending_quotes = self._scalar(
             "SELECT COUNT(*) FROM quotes WHERE status IN ('Brouillon', 'Envoye')"
         )
@@ -1321,7 +1533,13 @@ class Database:
         revenue_map = {item["key"]: 0.0 for item in months}
         expense_map = {item["key"]: 0.0 for item in months}
 
-        for row in self.connection.execute("SELECT issue_date, total FROM invoices").fetchall():
+        for row in self.connection.execute(
+            """
+            SELECT issue_date, total
+            FROM invoices
+            WHERE status IN ('Envoyee', 'Payee', 'En retard')
+            """
+        ).fetchall():
             key = row["issue_date"][:7]
             if key in revenue_map:
                 revenue_map[key] += float(row["total"])
@@ -1354,9 +1572,11 @@ class Database:
             profit_series.append((month["label"], revenue - expenses))
 
         sales_categories = defaultdict(float)
-        invoice_categories_total = self._scalar("SELECT COALESCE(SUM(total), 0) FROM invoices")
+        invoice_categories_total = self._scalar(
+            "SELECT COALESCE(SUM(total), 0) FROM invoices WHERE status IN ('Envoyee', 'Payee', 'En retard')"
+        )
         if float(invoice_categories_total):
-            sales_categories["Factures"] = float(invoice_categories_total)
+            sales_categories["Factures confirmees"] = float(invoice_categories_total)
 
         for row in self.connection.execute(
             """
@@ -1370,9 +1590,10 @@ class Database:
 
         expense_categories = defaultdict(float)
         for row in self.connection.execute(
-            "SELECT category, amount, amount_ttc FROM expenses"
+            "SELECT category, amount, amount_ttc, expense_kind FROM expenses"
         ).fetchall():
-            expense_categories[row["category"]] += float(row["amount_ttc"] or row["amount"])
+            category_label = "Paie employes" if row["expense_kind"] == "employee" else row["category"]
+            expense_categories[category_label] += float(row["amount_ttc"] or row["amount"])
 
         latest_invoices = self.connection.execute(
             """
@@ -1402,11 +1623,85 @@ class Database:
             """
         ).fetchall()
 
+        cutoff = (date.today().fromordinal(date.today().toordinal() - 90)).isoformat()
+        activity_points: list[dict] = []
+
+        for row in self.connection.execute(
+            """
+            SELECT issue_date AS event_date, total AS amount, number, client_name
+            FROM invoices
+            WHERE issue_date >= ? AND status IN ('Envoyee', 'Payee', 'En retard')
+            ORDER BY issue_date ASC, id ASC
+            """,
+            (cutoff,),
+        ).fetchall():
+            activity_points.append(
+                {
+                    "date": row["event_date"],
+                    "amount": float(row["amount"]),
+                    "kind": "invoice",
+                    "direction": "income",
+                    "label": f"Facture {row['number']} - {row['client_name']}",
+                }
+            )
+
+        for row in self.connection.execute(
+            """
+            SELECT sale_date AS event_date, COALESCE(NULLIF(amount_ttc, 0), amount) AS amount, company_name, category, source_type, source_invoice_id
+            FROM sales
+            WHERE sale_date >= ?
+            ORDER BY sale_date ASC, id ASC
+            """,
+            (cutoff,),
+        ).fetchall():
+            if row["source_type"] == "invoice" and row["source_invoice_id"] is not None:
+                continue
+            activity_points.append(
+                {
+                    "date": row["event_date"],
+                    "amount": float(row["amount"]),
+                    "kind": "sale",
+                    "direction": "income",
+                    "label": f"Recette {row['category']} - {row['company_name']}",
+                }
+            )
+
+        for row in self.connection.execute(
+            """
+            SELECT expense_date AS event_date, COALESCE(NULLIF(amount_ttc, 0), amount) AS amount, company_name, expense_kind, expense_label, employee_name, category
+            FROM expenses
+            WHERE expense_date >= ?
+            ORDER BY expense_date ASC, id ASC
+            """,
+            (cutoff,),
+        ).fetchall():
+            activity_points.append(
+                {
+                    "date": row["event_date"],
+                    "amount": float(row["amount"]),
+                    "kind": "employee_expense" if row["expense_kind"] == "employee" else "expense",
+                    "direction": "expense",
+                    "label": (
+                        f"{row['expense_label'] or 'Paie'} - {row['employee_name'] or row['company_name']}"
+                        if row["expense_kind"] == "employee"
+                        else f"Depense {row['category']} - {row['company_name']}"
+                    ),
+                }
+            )
+
+        activity_points.sort(key=lambda item: (item["date"], item["direction"], item["amount"]))
+
         return {
             "revenue_total": revenue_total,
+            "invoice_revenue_total": float(invoice_total),
+            "manual_revenue_total": float(manual_sales_total),
+            "draft_revenue_total": float(draft_invoice_total),
             "expenses_total": float(expenses_total),
+            "general_expenses_total": float(expenses_total) - float(employee_expenses_total),
+            "employee_expenses_total": float(employee_expenses_total),
             "profit_total": profit_total,
             "open_invoices": int(open_invoices),
+            "draft_invoices": int(draft_invoices),
             "pending_quotes": int(pending_quotes),
             "pending_todos": int(pending_todos),
             "revenue_series": revenue_series,
@@ -1416,6 +1711,7 @@ class Database:
             "latest_invoices": [dict(row) for row in latest_invoices],
             "latest_quotes": [dict(row) for row in latest_quotes],
             "latest_todos": [dict(row) for row in latest_todos],
+            "activity_points": activity_points,
         }
 
     def calendar_snapshot(self, year: int, month: int) -> dict:
@@ -1440,6 +1736,7 @@ class Database:
         month_expenses = 0.0
         invoice_revenue = 0.0
         manual_revenue = 0.0
+        employee_expenses = 0.0
 
         invoice_rows = self.connection.execute(
             """
@@ -1454,18 +1751,20 @@ class Database:
             if row["issue_date"].startswith(month_key):
                 entry = days[row["issue_date"]]
                 amount = float(row["total"])
-                entry["revenue"] += amount
                 entry["invoice_count"] += 1
+                is_recognized = row["status"] in RECOGNIZED_INVOICE_STATUSES
+                if is_recognized:
+                    entry["revenue"] += amount
+                    month_revenue += amount
+                    invoice_revenue += amount
                 entry["items"].append(
                     {
-                        "kind": "invoice",
+                        "kind": "invoice" if is_recognized else "invoice_draft",
                         "label": f"Facture {row['number']} - {row['client_name']}",
                         "amount": amount,
                         "status": row["status"],
                     }
                 )
-                month_revenue += amount
-                invoice_revenue += amount
             if row["due_date"].startswith(month_key) and row["due_date"] != row["issue_date"]:
                 days[row["due_date"]]["items"].append(
                     {
@@ -1504,7 +1803,7 @@ class Database:
 
         expense_rows = self.connection.execute(
             """
-            SELECT id, expense_date, company_name, category, amount, amount_ht, amount_ttc, source_type
+            SELECT id, expense_date, company_name, category, expense_kind, expense_label, employee_name, payroll_month, amount, amount_ht, amount_ttc, source_type
             FROM expenses
             WHERE substr(expense_date, 1, 7) = ?
             ORDER BY expense_date ASC, id ASC
@@ -1516,12 +1815,21 @@ class Database:
             entry = days[row["expense_date"]]
             entry["expenses"] += amount
             entry["expense_count"] += 1
+            if row["expense_kind"] == "employee":
+                employee_expenses += amount
+                label = f"{row['expense_label'] or 'Salaire'} - {row['employee_name'] or row['company_name']}"
+                kind = "employee_expense"
+                status = row["payroll_month"] or row["category"]
+            else:
+                label = f"Depense - {row['company_name']}"
+                kind = "expense"
+                status = row["category"]
             entry["items"].append(
                 {
-                    "kind": "expense",
-                    "label": f"Depense - {row['company_name']}",
+                    "kind": kind,
+                    "label": label,
                     "amount": amount,
-                    "status": row["category"],
+                    "status": status,
                 }
             )
             month_expenses += amount
@@ -1575,6 +1883,7 @@ class Database:
             "days": days,
             "month_revenue": month_revenue,
             "month_expenses": month_expenses,
+            "employee_expenses": employee_expenses,
             "month_balance": month_revenue - month_expenses,
             "invoice_revenue": invoice_revenue,
             "manual_revenue": manual_revenue,

@@ -5,7 +5,7 @@ import html
 import re
 from pathlib import Path
 
-from .config import COLOR_CORAL, COLOR_NAVY, COLOR_TEAL, storage_root
+from .config import storage_root
 
 
 def money(value: float) -> str:
@@ -86,70 +86,85 @@ def build_document_html(kind: str, payload: dict) -> str:
     <title>{doc_label} {payload['number']}</title>
     <style>
         body {{
-            background: linear-gradient(180deg, #f5f7fb 0%, #ffffff 100%);
-            color: #17324d;
-            font-family: "Segoe UI", sans-serif;
+            background: #f8fafc;
+            color: #1e293b;
+            font-family: "Inter", "Segoe UI", sans-serif;
             margin: 0;
             padding: 40px;
         }}
         .sheet {{
             background: #ffffff;
-            border-radius: 28px;
-            box-shadow: 0 25px 80px rgba(21, 48, 75, 0.12);
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            box-shadow: 0 16px 38px rgba(15, 35, 64, 0.08);
             margin: 0 auto;
             max-width: 980px;
-            overflow: hidden;
+            padding: 40px 44px 48px;
         }}
-        .banner {{
-            background: linear-gradient(120deg, {COLOR_NAVY} 0%, {COLOR_TEAL} 70%, {COLOR_CORAL} 100%);
-            color: #ffffff;
+        .header {{
+            align-items: flex-start;
             display: flex;
             justify-content: space-between;
-            padding: 36px 44px;
+            gap: 24px;
+            padding-bottom: 26px;
+            border-bottom: 1px solid #e2e8f0;
         }}
         .logo {{
-            background: rgba(255, 255, 255, 0.12);
-            border-radius: 20px;
+            border-radius: 12px;
             height: 68px;
             object-fit: contain;
-            padding: 10px;
             width: 68px;
         }}
         .wordmark {{
             align-items: center;
-            background: rgba(255, 255, 255, 0.12);
-            border-radius: 20px;
-            display: inline-flex;
-            font-size: 24px;
+            color: #1e293b;
+            display: flex;
+            font-size: 26px;
             font-weight: 700;
             height: 68px;
-            justify-content: center;
-            padding: 0 22px;
+            letter-spacing: -0.02em;
         }}
-        .banner h1 {{
-            font-size: 42px;
+        .brand {{
+            display: flex;
+            gap: 18px;
+            align-items: center;
+        }}
+        .brand-copy p {{
+            color: #64748b;
+            margin: 4px 0 0 0;
+        }}
+        .doc-title {{
+            font-size: 38px;
+            font-weight: 700;
+            margin: 0 0 12px 0;
+        }}
+        .doc-meta {{
+            text-align: right;
+        }}
+        .doc-meta p {{
+            color: #475569;
+            margin: 6px 0;
+        }}
+        .doc-meta strong {{
+            color: #0f2340;
+        }}
+        .header h1 {{
             margin: 0 0 6px 0;
-        }}
-        .banner p {{
-            margin: 4px 0;
-            opacity: 0.88;
-        }}
-        .content {{
-            padding: 36px 44px 48px;
         }}
         .grid {{
             display: grid;
             gap: 20px;
             grid-template-columns: 1.1fr 0.9fr;
-            margin-bottom: 28px;
+            margin: 28px 0;
         }}
         .panel {{
             background: #f8fafc;
-            border: 1px solid #dce6f1;
-            border-radius: 20px;
+            border: 1px solid #e2e8f0;
+            border-radius: 14px;
             padding: 20px 22px;
         }}
         .panel h3 {{
+            color: #2563eb;
             font-size: 12px;
             letter-spacing: 0.12em;
             margin: 0 0 10px 0;
@@ -165,12 +180,12 @@ def build_document_html(kind: str, payload: dict) -> str:
             width: 100%;
         }}
         th, td {{
-            border-bottom: 1px solid #e4ebf4;
+            border-bottom: 1px solid #e2e8f0;
             padding: 14px 10px;
             text-align: left;
         }}
         th {{
-            color: #607287;
+            color: #64748b;
             font-size: 12px;
             letter-spacing: 0.05em;
             text-transform: uppercase;
@@ -188,8 +203,8 @@ def build_document_html(kind: str, payload: dict) -> str:
             min-width: 260px;
         }}
         .grand-total {{
-            background: #f3f7fb;
-            border-radius: 16px;
+            background: #eff6ff;
+            border-radius: 14px;
             font-size: 20px;
             font-weight: 700;
             padding: 14px 18px;
@@ -198,19 +213,22 @@ def build_document_html(kind: str, payload: dict) -> str:
             margin-top: 24px;
         }}
         .footer {{
-            color: #607287;
+            color: #64748b;
             margin-top: 28px;
         }}
     </style>
 </head>
 <body>
     <div class="sheet">
-        <div class="banner">
-            <div>
+        <div class="header">
+            <div class="brand">
                 {logo_block}
+                <div class="brand-copy">
+                    <div class="doc-title">{doc_label}</div>
+                    <p>{html.escape(company.get('company_name', ''))}</p>
+                </div>
             </div>
-            <div style="text-align:right;">
-                <h1>{doc_label}</h1>
+            <div class="doc-meta">
                 <p><strong>Numero:</strong> {html.escape(payload['number'])}</p>
                 <p><strong>Date:</strong> {html.escape(payload['issue_date'])}</p>
                 <p><strong>{period_label}:</strong> {html.escape(period_value)}</p>
@@ -218,53 +236,51 @@ def build_document_html(kind: str, payload: dict) -> str:
                 <p><strong>Ajoute le:</strong> {html.escape(generated_at)}</p>
             </div>
         </div>
-        <div class="content">
-            <div class="grid">
-                <div class="panel">
-                    <h3>Entreprise</h3>
-                    <p><strong>{html.escape(company.get('company_name', ''))}</strong></p>
-                    <p>{html.escape(company.get('legal_name', ''))}</p>
-                    <p>{html.escape(company.get('address', ''))}</p>
-                    <p>SIRET: {html.escape(company.get('siret', ''))}</p>
-                    <p>TVA: {html.escape(company.get('vat_number', ''))}</p>
-                    <p>{html.escape(company.get('email', ''))} - {html.escape(company.get('phone', ''))}</p>
-                </div>
-                <div class="panel">
-                    <h3>Client</h3>
-                    <p><strong>{html.escape(payload['client_name'])}</strong></p>
-                    <p>{html.escape(payload.get('client_address', ''))}</p>
-                    <p>{html.escape(payload.get('client_email', ''))}</p>
-                </div>
+        <div class="grid">
+            <div class="panel">
+                <h3>Entreprise</h3>
+                <p><strong>{html.escape(company.get('company_name', ''))}</strong></p>
+                <p>{html.escape(company.get('legal_name', ''))}</p>
+                <p>{html.escape(company.get('address', ''))}</p>
+                <p>SIRET: {html.escape(company.get('siret', ''))}</p>
+                <p>TVA: {html.escape(company.get('vat_number', ''))}</p>
+                <p>{html.escape(company.get('email', ''))} - {html.escape(company.get('phone', ''))}</p>
             </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th>Description</th>
-                        <th>Quantite</th>
-                        <th>Prix unitaire</th>
-                        <th>Total</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {''.join(items_rows)}
-                </tbody>
-            </table>
-
-            <div class="totals">
-                <div class="total-line"><span>Sous-total</span><strong>{money(payload['subtotal'])}</strong></div>
-                <div class="total-line"><span>TVA ({payload['tax_rate']} %)</span><strong>{money(payload['tax_amount'])}</strong></div>
-                <div class="total-line grand-total"><span>Total</span><span>{money(payload['total'])}</span></div>
+            <div class="panel">
+                <h3>Client</h3>
+                <p><strong>{html.escape(payload['client_name'])}</strong></p>
+                <p>{html.escape(payload.get('client_address', ''))}</p>
+                <p>{html.escape(payload.get('client_email', ''))}</p>
             </div>
+        </div>
 
-            <div class="notes">
-                <h3 style="margin-bottom:8px;">Notes</h3>
-                <p>{html.escape(payload.get('notes', '') or 'Aucune note.')}</p>
-            </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Description</th>
+                    <th>Quantite</th>
+                    <th>Prix unitaire</th>
+                    <th>Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(items_rows)}
+            </tbody>
+        </table>
 
-            <div class="footer">
-                {html.escape(company.get('footer', ''))}
-            </div>
+        <div class="totals">
+            <div class="total-line"><span>Sous-total</span><strong>{money(payload['subtotal'])}</strong></div>
+            <div class="total-line"><span>TVA ({payload['tax_rate']} %)</span><strong>{money(payload['tax_amount'])}</strong></div>
+            <div class="total-line grand-total"><span>Total</span><span>{money(payload['total'])}</span></div>
+        </div>
+
+        <div class="notes">
+            <h3 style="margin-bottom:8px;">Notes</h3>
+            <p>{html.escape(payload.get('notes', '') or 'Aucune note.')}</p>
+        </div>
+
+        <div class="footer">
+            {html.escape(company.get('footer', ''))}
         </div>
     </div>
 </body>
