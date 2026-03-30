@@ -1,0 +1,120 @@
+name: build-downloads
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - website/downloads/**
+
+jobs:
+  build:
+    if: github.actor != 'github-actions[bot]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+          - os: macos-latest
+            label: macos
+          - os: ubuntu-latest
+            label: linux
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-build.txt
+
+      - name: Build release artifact
+        run: python scripts/build_release.py --output-dir release_assets
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: velora-finance-${{ matrix.label }}
+          path: release_assets/*
+
+  publish-downloads:
+    if: github.actor != 'github-actions[bot]'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          merge-multiple: true
+          pattern: velora-finance-*
+
+      - name: Publish downloads into website folder
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import json
+          import shutil
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(".").resolve()
+          downloads_dir = root / "website" / "downloads"
+          downloads_dir.mkdir(parents=True, exist_ok=True)
+
+          expected = {
+              "windows": "velora-finance-windows.exe",
+              "macos": "velora-finance-macos.zip",
+              "linux": "velora-finance-linux.tar.gz",
+          }
+
+          for filename in expected.values():
+              (downloads_dir / filename).unlink(missing_ok=True)
+
+          artifact_dir = root / "downloaded_artifacts"
+          for file_path in artifact_dir.glob("*"):
+              if file_path.is_file() and file_path.name in expected.values():
+                  shutil.copy2(file_path, downloads_dir / file_path.name)
+
+          manifest_path = downloads_dir / "manifest.json"
+          manifest = {
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+          }
+          for key, filename in expected.items():
+              target = downloads_dir / filename
+              manifest[key] = {
+                  "available": target.exists(),
+                  "filename": filename,
+                  "url": f"/downloads/{filename}",
+              }
+
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Commit published downloads
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add website/downloads
+          if git diff --cached --quiet; then
+            echo "No published download changes."
+            exit 0
+          fi
+          git commit -m "chore: publish website downloads"
+          git push

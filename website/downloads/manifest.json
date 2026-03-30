@@ -1,0 +1,18 @@
+{
+  "generated_at": null,
+  "windows": {
+    "available": false,
+    "filename": "velora-finance-windows.exe",
+    "url": "/downloads/velora-finance-windows.exe"
+  },
+  "macos": {
+    "available": false,
+    "filename": "velora-finance-macos.zip",
+    "url": "/downloads/velora-finance-macos.zip"
+  },
+  "linux": {
+    "available": false,
+    "filename": "velora-finance-linux.tar.gz",
+    "url": "/downloads/velora-finance-linux.tar.gz"
+  }
+}
